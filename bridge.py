@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Claude Code ⇔ Slack Bridge (DM専用 / シングルユーザー)
-======================================================
-Mac上で動くClaude Codeを1人のユーザーがDMで操作するブリッジ。
+Claude Code ⇔ Slack Bridge
+===========================
+Mac上で動くClaude CodeをSlackから操作するブリッジ。
 複数タスクの同時実行に対応。
 
-DMでのコマンド:
+動作モード:
+  - DMモード: 管理者（ADMIN_SLACK_USER_ID）のみ。メンション不要。
+  - チャンネルモード: 許可されたチャンネル・ユーザーのみ。@bot メンション必須。
+
+コマンド:
   <タスク内容>              → 新しいタスクを実行
   in <path> <タスク>        → 指定ディレクトリでタスクを実行
   continue [#id] <指示>     → セッションを続行（#id省略で直前タスク）
@@ -21,6 +25,7 @@ DMでのコマンド:
 
 import fcntl
 import json
+import logging
 import os
 import pty
 import re
@@ -45,21 +50,50 @@ from slack_sdk import WebClient
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 # ── 設定 ──────────────────────────────────────────────────
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-SLACK_USER_ID = os.environ["SLACK_USER_ID"]  # Bot所有者のSlackユーザーID
+# 管理者ユーザーID（必須）。DM通知先・DMモードのアクセス制御に使用。
+ADMIN_SLACK_USER_ID = os.environ["ADMIN_SLACK_USER_ID"]
+# チャンネルモード: 許可ユーザー（カンマ区切り or "*" で全許可）。未設定ならDMのみ。
+SLACK_ALLOWED_USERS = os.getenv("SLACK_ALLOWED_USERS", "")
+# チャンネルモード: 許可チャンネル（カンマ区切り or "*" で全許可）。未設定ならDMのみ。
+SLACK_ALLOWED_CHANNELS = os.getenv("SLACK_ALLOWED_CHANNELS", "")
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "claude")
 WORKING_DIR = os.getenv("WORKING_DIR", os.getcwd())
 DEFAULT_ALLOWED_TOOLS = os.getenv(
     "DEFAULT_ALLOWED_TOOLS",
     "Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite",
 )
-MACOS_NOTIFICATION = os.getenv("MACOS_NOTIFICATION", "true").lower() == "true"
-
 
 MAX_SLACK_MSG_LENGTH = 3000
 INSTANCE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".instance_state.json")
+
+
+def _is_user_allowed(user_id: str) -> bool:
+    """ユーザーが操作を許可されているか（チャンネルモード用）"""
+    if user_id == ADMIN_SLACK_USER_ID:
+        return True  # 管理者は常に許可
+    if SLACK_ALLOWED_USERS == "*":
+        return True
+    allowed = {u.strip() for u in SLACK_ALLOWED_USERS.split(",") if u.strip()}
+    return user_id in allowed
+
+
+def _is_channel_allowed(channel_id: str) -> bool:
+    """チャンネルが許可されているか"""
+    if SLACK_ALLOWED_CHANNELS == "*":
+        return True
+    allowed = {c.strip() for c in SLACK_ALLOWED_CHANNELS.split(",") if c.strip()}
+    return channel_id in allowed
+
 
 TASK_LABELS = [
     ("🔵", "blue"),
@@ -101,6 +135,7 @@ class Task:
     tool_calls: list = field(default_factory=list)
     error: Optional[str] = None
     master_fd: Optional[int] = None
+    user_id: Optional[str] = None  # タスク実行者のSlack User ID
 
     @property
     def short_id(self) -> str:
@@ -161,7 +196,7 @@ def detect_running_claude_instances() -> list[dict]:
                 "tty": tty,
             })
     except Exception as e:
-        print(f"[WARNING] claudeプロセス検出エラー: {e}", file=sys.stderr)
+        logger.warning("claudeプロセス検出エラー: %s", e)
     return instances
 
 
@@ -504,7 +539,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, dm_channel: str, client: 
                 )
                 status_msg_ts = resp["ts"]
         except Exception as e:
-            print(f"[JSONL状態更新エラー] PID {pid}: {e}", file=sys.stderr, flush=True)
+            logger.error("JSONL状態更新エラー PID %d: %s", pid, e)
 
     def _finalize_status():
         """ステータスメッセージを確定（⏳除去）。メッセージは保持して次回も同じメッセージに追記。"""
@@ -526,7 +561,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, dm_channel: str, client: 
                 text=f":speech_balloon: {display_prefix}\n{display}",
             )
         except Exception as e:
-            print(f"[JSONL応答投稿エラー] {display_prefix}: {e}", file=sys.stderr, flush=True)
+            logger.error("JSONL応答投稿エラー %s: %s", display_prefix, e)
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
@@ -536,7 +571,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, dm_channel: str, client: 
                 text=text,
             )
         except Exception as e:
-            print(f"[JSONL質問投稿エラー] PID {pid}: {e}", file=sys.stderr, flush=True)
+            logger.error("JSONL質問投稿エラー PID %d: %s", pid, e)
         # pending_question を設定（最初の質問のみ対応）
         if metadata and metadata.get("questions"):
             q = metadata["questions"][0]
@@ -830,7 +865,7 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
             text=text,
         )
     except Exception as e:
-        print(f"[許可プロンプト投稿エラー] {e}", file=sys.stderr, flush=True)
+        logger.error("許可プロンプト投稿エラー: %s", e)
 
     inst["pending_question"] = {
         "options": options,
@@ -888,7 +923,7 @@ def _update_thinking_message(
             text=f"```\n{display}\n```\n:hourglass_flowing_sand: _思考中..._",
         )
     except Exception as e:
-        print(f"[思考中更新エラー] PID {pid}: {e}", file=sys.stderr, flush=True)
+        logger.error("思考中更新エラー PID %d: %s", pid, e)
 
 
 def _post_final_response(
@@ -910,7 +945,7 @@ def _post_final_response(
             text=f"{header}\n```\n{display}\n```",
         )
     except Exception as e:
-        print(f"[応答投稿エラー] PID {pid}: {e}", file=sys.stderr, flush=True)
+        logger.error("応答投稿エラー PID %d: %s", pid, e)
     # 元の「送信しました」メッセージから⏳を除去
     try:
         client.chat_update(
@@ -1057,7 +1092,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
                             text=f":speech_balloon: PID {pid}\n```\n{display}\n```",
                         )
                 except Exception as e:
-                    print(f"[パッシブ監視投稿エラー] PID {pid}: {e}", file=sys.stderr)
+                    logger.error("パッシブ監視投稿エラー PID %d: %s", pid, e)
                 # ベースライン更新
                 inst["passive_baseline_len"] = len(current)
                 inst["passive_baseline_marker"] = current[-500:] if len(current) >= 500 else current
@@ -1085,14 +1120,14 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
                         )
                         passive_msg_ts = resp["ts"]
                 except Exception as e:
-                    print(f"[パッシブ進捗更新エラー] PID {pid}: {e}", file=sys.stderr)
+                    logger.error("パッシブ進捗更新エラー PID %d: %s", pid, e)
             continue
 
         poll_count += 1
 
         current = _read_terminal_contents(tty_device)
         if current is None:
-            print(f"[MON {pid}] poll {poll_count}: read failed", file=sys.stderr, flush=True)
+            logger.debug("MON %d poll %d: read failed", pid, poll_count)
             continue
 
         # ベースライン内容を記録（初回のみ）
@@ -1118,7 +1153,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
                 new_start = next_nl + 1
         new_text_raw = current[new_start:]
         cur_len = len(current)
-        print(f"[MON {pid}] poll {poll_count}: cur_len={cur_len} new_start={new_start} new_len={len(new_text_raw)}", file=sys.stderr, flush=True)
+        logger.debug("MON %d poll %d: cur_len=%d new_start=%d new_len=%d", pid, poll_count, cur_len, new_start, len(new_text_raw))
 
         # 新しいテキストがない場合
         if not new_text_raw.strip():
@@ -1140,12 +1175,12 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
         # デバッグ: フィルタ前のクリーンテキストも表示
         clean_lines = _strip_ansi(new_text).strip().split('\n')
         clean_preview = clean_lines[:5] if clean_lines else []
-        print(f"[MON {pid}] poll {poll_count}: filtered_len={len(filtered)} prompt={prompt_found} raw_lines={clean_preview!r}", file=sys.stderr, flush=True)
+        logger.debug("MON %d poll %d: filtered_len=%d prompt=%s raw_lines=%r", pid, poll_count, len(filtered), prompt_found, clean_preview)
 
         if not filtered:
             # フィルタ後にテキストがないが、❯プロンプトが末尾に出現 → 出力なしで完了
             if prompt_found:
-                print(f"[MON {pid}] → コマンド実行完了（filtered empty + prompt）", file=sys.stderr, flush=True)
+                logger.debug("MON %d → コマンド実行完了（filtered empty + prompt）", pid)
                 _post_final_response(client, dm_channel, thread_ts, response_msg_ts, "（コマンド実行完了）", pid)
                 _reset_state()
             continue
@@ -1154,7 +1189,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
 
         # 応答完了判定1: ❯ プロンプトが出現（次の入力待ち状態）
         if prompt_found:
-            print(f"[MON {pid}] → 応答投稿（prompt検出）", file=sys.stderr, flush=True)
+            logger.debug("MON %d → 応答投稿（prompt検出）", pid)
             _post_final_response(client, dm_channel, thread_ts, response_msg_ts, filtered, pid)
             _reset_state()
             continue
@@ -1169,14 +1204,14 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
             last_filtered = filtered
 
         if stable_count >= STABLE_THRESHOLD:
-            print(f"[MON {pid}] → 応答投稿（安定検出）", file=sys.stderr, flush=True)
+            logger.debug("MON %d → 応答投稿（安定検出）", pid)
             _post_final_response(client, dm_channel, thread_ts, response_msg_ts, filtered, pid)
             _reset_state()
             continue
 
         # 思考中の進捗更新: PROGRESS_INTERVALポールごとに途中経過を表示（ベストエフォート）
         if poll_count % PROGRESS_INTERVAL == 0 and filtered != last_progress_text:
-            print(f"[MON {pid}] → 思考中更新", file=sys.stderr, flush=True)
+            logger.debug("MON %d → 思考中更新", pid)
             _update_thinking_message(client, dm_channel, response_msg_ts, filtered, pid)
             last_progress_text = filtered
 
@@ -1196,24 +1231,6 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, dm_channel: str, client
             channel=dm_channel,
             thread_ts=thread_ts,
             text=f":stop_button: PID {pid} が終了しました",
-        )
-    except Exception:
-        pass
-
-
-# ── macOS通知 ─────────────────────────────────────────────
-def send_macos_notification(title: str, message: str):
-    if not MACOS_NOTIFICATION:
-        return
-    try:
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                f'display notification "{message}" with title "{title}"',
-            ],
-            capture_output=True,
-            timeout=5,
         )
     except Exception:
         pass
@@ -1444,10 +1461,6 @@ class ClaudeCodeRunner:
                 elapsed = (task.completed_at - task.started_at).total_seconds()
                 summary = self._format_result(task, elapsed, show_result=not jsonl_monitored)
                 self._post_status(task, summary)
-                send_macos_notification(
-                    f"Claude Code {task.short_id} ✅",
-                    f"{task.prompt[:40]} ({elapsed:.0f}秒)",
-                )
             else:
                 stderr_raw = proc.stderr.read() if proc.stderr else ""
                 stderr_output = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else stderr_raw
@@ -1458,7 +1471,6 @@ class ClaudeCodeRunner:
                     task,
                     f"{task.display_label}  :x: 失敗 (exit {proc.returncode})\n```{stderr_output[:1000]}```",
                 )
-                send_macos_notification(f"Claude Code {task.short_id} ❌", "タスクが失敗しました")
 
         except Exception as e:
             task.status = TaskStatus.FAILED
@@ -1483,7 +1495,8 @@ class ClaudeCodeRunner:
 
     def _format_result(self, task: Task, elapsed: float, show_result: bool = True) -> str:
         dir_name = os.path.basename(task.working_dir or WORKING_DIR)
-        parts = [f"{task.display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`"]
+        user_info = f"  <@{task.user_id}>" if task.user_id else ""
+        parts = [f"{task.display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`{user_info}"]
         if task.tool_calls:
             tools_summary = ", ".join(f"`{t['name']}`" for t in task.tool_calls[:10])
             if len(task.tool_calls) > 10:
@@ -1510,7 +1523,7 @@ class ClaudeCodeRunner:
                 resp = self.client.chat_postMessage(channel=channel, text=text)
                 task.thread_ts = resp["ts"]
         except Exception as e:
-            print(f"[Slack投稿エラー] {e}", file=sys.stderr)
+            logger.error("Slack投稿エラー: %s", e)
 
     def cancel_task(self, task_id: int) -> bool:
         task = self.active_tasks.get(task_id)
@@ -1581,7 +1594,7 @@ def _save_instance_state():
         with open(INSTANCE_STATE_FILE, "w") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARNING] インスタンス状態の保存に失敗: {e}", file=sys.stderr)
+        logger.warning("インスタンス状態の保存に失敗: %s", e)
 
 
 def _load_instance_state() -> dict[int, str]:
@@ -1599,7 +1612,7 @@ def _load_instance_state() -> dict[int, str]:
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
     except Exception as e:
-        print(f"[WARNING] インスタンス状態の読み込みに失敗: {e}", file=sys.stderr)
+        logger.warning("インスタンス状態の読み込みに失敗: %s", e)
         return {}
 
 BOT_USER_ID = None
@@ -1630,7 +1643,7 @@ def _register_instance(inst: dict, reuse_thread_ts: str | None = None) -> str | 
                 text=f":recycle: Bridge再起動 — PID {inst['pid']} の監視を再開します（{monitor_label}）",
             )
         except Exception as e:
-            print(f"[WARNING] 復元通知の送信に失敗: {e}", file=sys.stderr)
+            logger.warning("復元通知の送信に失敗: %s", e)
     else:
         resp = slack_client.chat_postMessage(
             channel=dm_channel,
@@ -1686,37 +1699,91 @@ def parse_task_id(s: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _strip_bot_mention(text: str) -> str:
+    """テキストから <@BOT_ID> を除去。除去しなかった場合は元のテキストをそのまま返す"""
+    bot_id = get_bot_user_id()
+    return re.sub(rf'<@{bot_id}>\s*', '', text).strip()
+
+
 @app.event("message")
-def handle_dm(event, say):
+def handle_message(event, say):
     channel_type = event.get("channel_type", "")
-    if channel_type != "im":
-        return
-    if event.get("bot_id") or event.get("user") == get_bot_user_id():
-        return
-    # 所有者以外のDMは無視
-    if event.get("user") != SLACK_USER_ID:
+    user_id = event.get("user", "")
+
+    # botメッセージは常に無視
+    if event.get("bot_id") or user_id == get_bot_user_id():
         return
 
-    text = event.get("text", "").strip()
-    if not text:
-        return
+    if channel_type == "im":
+        # ── DMモード: 管理者のみ ──
+        if user_id != ADMIN_SLACK_USER_ID:
+            return
 
+        text = event.get("text", "").strip()
+        if not text:
+            return
+
+        channel_id = event.get("channel", "")
+
+        # インスタンススレッドへの返信 → TTYに転送
+        parent_ts = event.get("thread_ts")
+        if parent_ts and parent_ts in instance_threads:
+            # "!" プレフィックス: "!clear" → "/clear" (Slackスラッシュコマンドとの競合回避)
+            input_text = "/" + text[1:] if text.startswith("!") else text
+            _handle_instance_input(input_text, say, parent_ts, channel_id)
+            return
+
+        _dispatch_command(text, event, say)
+
+    elif channel_type in ("channel", "group"):
+        # ── チャンネルモード ──
+        channel_id = event.get("channel", "")
+
+        # チャンネル許可チェック
+        if not _is_channel_allowed(channel_id):
+            return
+
+        # ユーザー許可チェック
+        if not _is_user_allowed(user_id):
+            return
+
+        text = event.get("text", "").strip()
+        if not text:
+            return
+
+        # スレッド返信 → 追跡中スレッドならCLIに転送（メンション不要）
+        parent_ts = event.get("thread_ts")
+        if parent_ts and parent_ts in instance_threads:
+            input_text = _strip_bot_mention(text)
+            # "!" プレフィックス: "!clear" → "/clear"
+            input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
+            _handle_instance_input(input_text, say, parent_ts, channel_id)
+            return
+
+        # トップレベルメッセージ: botメンション必須
+        stripped = _strip_bot_mention(text)
+        if stripped == text:
+            return  # メンションなし → 無視
+        text = stripped
+        if not text:
+            return
+
+        _dispatch_command(text, event, say)
+
+
+def _dispatch_command(text: str, event: dict, say):
+    """コマンド解析・実行（DM / チャンネル共通）"""
     channel_id = event.get("channel", "")
+    channel_type = event.get("channel_type", "")
     thread_ts = event.get("ts")
-
-    # インスタンススレッドへの返信 → TTYに転送
-    parent_ts = event.get("thread_ts")
-    if parent_ts and parent_ts in instance_threads:
-        # "!" プレフィックス: "!clear" → "/clear" (Slackスラッシュコマンドとの競合回避)
-        input_text = "/" + text[1:] if text.startswith("!") else text
-        _handle_instance_input(input_text, say, parent_ts, channel_id)
-        return
+    user_id = event.get("user", "")
+    is_channel = channel_type in ("channel", "group")
 
     cmd_lower = text.lower()
 
     # ── help ──
     if cmd_lower in ("help", "?"):
-        say(text=_help_text(), thread_ts=thread_ts)
+        say(text=_help_text(is_channel=is_channel), thread_ts=thread_ts)
         return
 
     # ── status ──
@@ -1756,17 +1823,17 @@ def handle_dm(event, say):
 
     # ── continue [#id] <指示> ──
     if cmd_lower.startswith("continue"):
-        _handle_continue(text, say, thread_ts, channel_id)
+        _handle_continue(text, say, thread_ts, channel_id, user_id)
         return
 
     # ── resume <session_id> <指示> ──
     if cmd_lower.startswith("resume "):
-        _handle_resume(text, say, thread_ts, channel_id)
+        _handle_resume(text, say, thread_ts, channel_id, user_id)
         return
 
     # ── in <path> <タスク> ──
     if cmd_lower.startswith("in "):
-        _handle_in_dir(text, say, thread_ts, channel_id)
+        _handle_in_dir(text, say, thread_ts, channel_id, user_id)
         return
 
     # ── 新規タスク ──
@@ -1776,6 +1843,7 @@ def handle_dm(event, say):
         channel_id=channel_id,
         working_dir=settings.get_working_dir(),
         allowed_tools=settings.consume_tools(),
+        user_id=user_id,
     )
     err = runner.run_task(task)
     if err:
@@ -2044,21 +2112,23 @@ def handle_mention(event, say):
     pass
 
 
-def _help_text() -> str:
+def _help_text(is_channel: bool = False) -> str:
+    prefix = "@bot " if is_channel else ""
+    mode = "チャンネル" if is_channel else "DM"
     return (
-        ":robot_face: *Claude Code Bridge (DM専用)* — 使い方:\n"
-        "• `<タスク>` → 新しいタスクを実行\n"
-        "• `in /path/to/dir <タスク>` → 指定ディレクトリで実行\n"
-        "• `continue <指示>` → 直前セッションを続行\n"
-        "• `continue #2 <指示>` → 指定タスクのセッションを続行\n"
-        "• `resume <session_id> <指示>` → 指定セッションを再開\n"
-        "• `status` → 全タスクの状態一覧\n"
-        "• `cancel #2` → タスクをキャンセル\n"
-        "• `cancel all` → 全タスクをキャンセル\n"
-        "• `cd <path>` → 作業ディレクトリ変更\n"
-        "• `tools <tool1,...>` → 次回の許可ツール設定\n"
-        "• `sessions` → セッション履歴\n"
-        "• `detect` → 実行中のclaude CLIインスタンスを検出・接続"
+        f":robot_face: *Claude Code Bridge ({mode})* — 使い方:\n"
+        f"• `{prefix}<タスク>` → 新しいタスクを実行\n"
+        f"• `{prefix}in /path/to/dir <タスク>` → 指定ディレクトリで実行\n"
+        f"• `{prefix}continue <指示>` → 直前セッションを続行\n"
+        f"• `{prefix}continue #2 <指示>` → 指定タスクのセッションを続行\n"
+        f"• `{prefix}resume <session_id> <指示>` → 指定セッションを再開\n"
+        f"• `{prefix}status` → 全タスクの状態一覧\n"
+        f"• `{prefix}cancel #2` → タスクをキャンセル\n"
+        f"• `{prefix}cancel all` → 全タスクをキャンセル\n"
+        f"• `{prefix}cd <path>` → 作業ディレクトリ変更\n"
+        f"• `{prefix}tools <tool1,...>` → 次回の許可ツール設定\n"
+        f"• `{prefix}sessions` → セッション履歴\n"
+        f"• `{prefix}detect` → 実行中のclaude CLIインスタンスを検出・接続"
     )
 
 
@@ -2087,9 +2157,10 @@ def _handle_status(say, thread_ts):
         prompt_preview = task.prompt[:50] + ("..." if len(task.prompt) > 50 else "")
         tool_count = len(task.tool_calls)
 
+        user_info = f"  <@{task.user_id}>" if task.user_id else ""
         lines.append(
             f"\n{task.display_label}"
-            f"  :file_folder: `{dir_name}` ({elapsed:.0f}秒, ツール{tool_count}回)\n"
+            f"  :file_folder: `{dir_name}` ({elapsed:.0f}秒, ツール{tool_count}回){user_info}\n"
             f"> {prompt_preview}"
         )
         if task.tool_calls:
@@ -2135,7 +2206,7 @@ def _handle_cd(text: str, say, thread_ts):
         say(text=f":warning: ディレクトリが見つかりません: `{new_dir}`", thread_ts=thread_ts)
 
 
-def _handle_continue(text: str, say, thread_ts, channel_id: str):
+def _handle_continue(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
     rest = text[8:].strip()
     if not rest:
         say(
@@ -2182,6 +2253,7 @@ def _handle_continue(text: str, say, thread_ts, channel_id: str):
         thread_ts=inherited_thread,
         label_emoji=inherited_emoji,
         label_name=inherited_label,
+        user_id=user_id,
     )
     if target_session:
         task.continue_session_id = target_session
@@ -2193,7 +2265,7 @@ def _handle_continue(text: str, say, thread_ts, channel_id: str):
         say(text=err, thread_ts=thread_ts)
 
 
-def _handle_resume(text: str, say, thread_ts, channel_id: str):
+def _handle_resume(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
     parts = text[7:].strip().split(maxsplit=1)
     if len(parts) < 2:
         say(text=":warning: 使い方: `resume <session_id> <指示>`", thread_ts=thread_ts)
@@ -2217,13 +2289,14 @@ def _handle_resume(text: str, say, thread_ts, channel_id: str):
         thread_ts=inherited_thread,
         label_emoji=inherited_emoji,
         label_name=inherited_label,
+        user_id=user_id,
     )
     err = runner.run_task(task)
     if err:
         say(text=err, thread_ts=thread_ts)
 
 
-def _handle_in_dir(text: str, say, thread_ts, channel_id: str):
+def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
     rest = text[3:].strip()
     parts = rest.split(maxsplit=1)
     if len(parts) < 2:
@@ -2242,6 +2315,7 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str):
         channel_id=channel_id,
         working_dir=dir_path,
         allowed_tools=settings.consume_tools(),
+        user_id=user_id,
     )
     err = runner.run_task(task)
     if err:
@@ -2310,7 +2384,7 @@ def _handle_detect(say, thread_ts):
             if _register_instance(inst):
                 registered += 1
         except Exception as e:
-            print(f"[WARNING] インスタンス登録エラー: {e}", file=sys.stderr)
+            logger.warning("インスタンス登録エラー: %s", e)
 
     say(
         text=f":mag: {registered}件の新しいclaude CLIインスタンスを検出・登録しました",
@@ -2320,24 +2394,24 @@ def _handle_detect(say, thread_ts):
 
 # ── エントリーポイント ────────────────────────────────────
 def main():
-    print("=" * 55)
-    print("  Claude Code ⇔ Slack Bridge")
-    print("  DM専用 / シングルユーザー")
-    print("=" * 55)
-    print(f"  User:        {SLACK_USER_ID}")
-    print(f"  Work Dir:    {WORKING_DIR}")
-    print(f"  Tools:       {DEFAULT_ALLOWED_TOOLS}")
-    print(f"  macOS通知:    {'ON' if MACOS_NOTIFICATION else 'OFF'}")
-    print("=" * 55)
-    print("Ctrl+C で終了\n")
+    logger.info("=" * 55)
+    logger.info("  Claude Code ⇔ Slack Bridge")
+    logger.info("=" * 55)
+    logger.info("  Admin:       %s", ADMIN_SLACK_USER_ID)
+    logger.info("  Work Dir:    %s", WORKING_DIR)
+    logger.info("  Tools:       %s", DEFAULT_ALLOWED_TOOLS)
+    logger.info("  Allowed Users:    %s", SLACK_ALLOWED_USERS or "(DM only)")
+    logger.info("  Allowed Channels: %s", SLACK_ALLOWED_CHANNELS or "(DM only)")
+    logger.info("=" * 55)
+    logger.info("Ctrl+C で終了")
 
     # 所有者とのDMチャンネルを開く
     global dm_channel
     try:
-        resp = slack_client.conversations_open(users=SLACK_USER_ID)
+        resp = slack_client.conversations_open(users=ADMIN_SLACK_USER_ID)
         dm_channel = resp["channel"]["id"]
     except Exception as e:
-        print(f"[WARNING] DMチャンネルのオープンに失敗: {e}", file=sys.stderr)
+        logger.warning("DMチャンネルのオープンに失敗: %s", e)
 
     if dm_channel:
         # 起動通知
@@ -2351,30 +2425,30 @@ def main():
                 ),
             )
         except Exception as e:
-            print(f"[WARNING] Slack起動通知の送信に失敗: {e}", file=sys.stderr)
+            logger.warning("Slack起動通知の送信に失敗: %s", e)
 
         # 保存された前回のインスタンス状態を読み込み（PID → thread_ts）
         saved_pid_threads = _load_instance_state()
         if saved_pid_threads:
-            print(f"  前回の状態: {len(saved_pid_threads)}件のインスタンスが生存中")
+            logger.info("前回の状態: %d件のインスタンスが生存中", len(saved_pid_threads))
 
         # 実行中のclaude CLIインスタンスを検出してスレッドを作成
         instances = detect_running_claude_instances()
         if instances:
-            print(f"  検出されたclaude CLIインスタンス: {len(instances)}件")
+            logger.info("検出されたclaude CLIインスタンス: %d件", len(instances))
             for inst in instances:
                 try:
                     reuse_ts = saved_pid_threads.get(inst["pid"])
                     _register_instance(inst, reuse_thread_ts=reuse_ts)
                 except Exception as e:
-                    print(f"[WARNING] インスタンス通知の送信に失敗: {e}", file=sys.stderr)
+                    logger.warning("インスタンス通知の送信に失敗: %s", e)
         else:
-            print("  実行中のclaude CLIインスタンス: なし")
+            logger.info("実行中のclaude CLIインスタンス: なし")
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     def shutdown(signum, frame):
-        print("\nシャットダウン中...")
+        logger.info("シャットダウン中...")
         runner.cancel_all()
         if dm_channel:
             try:
