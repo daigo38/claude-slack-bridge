@@ -40,13 +40,22 @@ import sys
 import termios
 import threading
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
@@ -79,7 +88,357 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
 )
 
 MAX_SLACK_MSG_LENGTH = 3000
+MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 CHANNEL_PROJECTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_projects.json")
+
+
+# ---------------------------------------------------------------------------
+# Slack 添付画像ダウンロード・正規化
+# ---------------------------------------------------------------------------
+
+
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトを自動追跡しないハンドラ（手動でAuth付きリダイレクトを行うため）"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            newurl, code, msg, headers, fp
+        )
+
+_no_redirect_opener = urllib.request.build_opener(_NoAutoRedirect)
+
+
+def _download_slack_file_content(url: str, token: str) -> bytes | None:
+    """SlackのファイルURLからバイナリデータをダウンロードする。
+
+    Python 3.11+ の urllib は異なるホストへのリダイレクト時に Authorization ヘッダーを
+    セキュリティ上の理由で自動削除する。Slackのファイル URL は
+    files.slack.com → <workspace>.slack.com 等にリダイレクトするため、
+    リダイレクトを手動追跡し、各ステップで Authorization を付与する。
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+
+    for _attempt in range(5):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with _no_redirect_opener.open(req) as resp:
+                data = resp.read()
+                logger.info("Slackファイル取得: status=%d, url=%s", resp.status, url[:80])
+                # HTMLログインページが返された場合
+                if data[:15] == b"<!DOCTYPE html>" or data[:5] == b"<html":
+                    logger.error("Slackがファイルの代わりにHTMLを返却 (%d bytes)。"
+                                 "Bot tokenの files:read スコープを確認してください。", len(data))
+                    return None
+                return data
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                new_url = e.headers.get("Location", "")
+                if not new_url:
+                    logger.warning("リダイレクトにLocationヘッダーなし")
+                    return None
+                # 相対URLを絶対URLに変換
+                if new_url.startswith("/"):
+                    parsed = urlparse(url)
+                    new_url = f"{parsed.scheme}://{parsed.netloc}{new_url}"
+                logger.info("リダイレクト追跡 (%d): %s → %s", e.code, url[:60], new_url[:60])
+                url = new_url
+                continue
+            logger.warning("Slackファイルダウンロード: HTTP %d", e.code)
+            return None
+
+    logger.warning("Slackファイルダウンロード: リダイレクト回数超過")
+    return None
+
+
+# Claude API がサポートする画像形式
+_API_SUPPORTED_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
+# 画像の長辺ピクセル上限（これを超えるとリサイズ）
+_MAX_IMAGE_LONG_EDGE = 8000
+
+
+def _normalize_image(path: str) -> str | None:
+    """画像ファイルを検証し、APIが処理できる形式に正規化する。
+
+    成功時は（変換後の）パスを返す。ファイルが無効な場合は None を返す。
+    Pillow 未インストール時はそのまま返す。
+    """
+    if PILImage is None:
+        return path
+
+    try:
+        img = PILImage.open(path)
+        img.load()  # 実際にデコードして破損を検出
+    except Exception:
+        # ファイルの先頭バイトをログ出力（HTMLエラーページ等の診断用）
+        try:
+            with open(path, "rb") as f:
+                head = f.read(64)
+            logger.error("画像ファイルを開けない: %s (先頭bytes: %r)", path, head)
+        except Exception:
+            logger.exception("画像ファイルを開けない（読み取りも失敗）: %s", path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+    try:
+        fmt = img.format
+        w, h = img.size
+        needs_convert = fmt not in _API_SUPPORTED_FORMATS
+        needs_resize = max(w, h) > _MAX_IMAGE_LONG_EDGE
+
+        if not needs_convert and not needs_resize:
+            img.close()
+            return path
+
+        if needs_resize:
+            ratio = _MAX_IMAGE_LONG_EDGE / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+
+        # 保存形式を決定（透過があればPNG、それ以外はJPEG）
+        if img.mode in ("RGBA", "LA", "P"):
+            out_fmt, ext = "PNG", ".png"
+        else:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            out_fmt, ext = "JPEG", ".jpg"
+
+        base = os.path.splitext(path)[0]
+        out_path = base + ext
+        img.save(out_path, out_fmt, quality=95)
+        new_w, new_h = img.size
+        img.close()
+
+        if out_path != path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        logger.info("画像を正規化: %s → %s (%dx%d, %s)",
+                    os.path.basename(path), os.path.basename(out_path), new_w, new_h, out_fmt)
+        return out_path
+    except Exception:
+        logger.exception("画像の変換に失敗: %s", path)
+        img.close()
+        return path  # 変換失敗時は元ファイルをそのまま試す
+
+
+def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
+    """イベントからファイル情報を抽出する。event.filesが空の場合はAPI経由で再取得を試みる。
+
+    タスク作成時にのみ呼ぶこと（毎メッセージでは呼ばない）。
+    """
+    files = event.get("files", [])
+    if files:
+        return files
+
+    # event.filesが空の場合、ファイルが添付されている手がかりを探す
+    file_ids = event.get("file_ids", [])
+    blocks = event.get("blocks", [])
+    has_upload = event.get("upload", False)
+    subtype = event.get("subtype", "")
+
+    # blocks内のfileブロックからfile_idを抽出
+    if not file_ids:
+        for block in blocks:
+            if block.get("type") == "file":
+                fid = block.get("file_id") or block.get("external_id")
+                if fid:
+                    file_ids.append(fid)
+
+    has_file_hints = file_ids or has_upload or subtype == "file_share"
+    if has_file_hints:
+        logger.info("event.filesは空だがファイルの手がかりあり (subtype=%s, upload=%s, file_ids=%s, event_keys=%s)",
+                    subtype, has_upload, file_ids, sorted(event.keys()))
+
+    # file_idがあればSlack APIでファイル情報を取得
+    if file_ids:
+        logger.info("file_ids=%sからファイル情報を取得", file_ids)
+        resolved = []
+        for fid in file_ids:
+            try:
+                resp = slack_client.files_info(file=fid)
+                if resp.get("ok"):
+                    resolved.append(resp["file"])
+            except Exception:
+                logger.exception("files.info失敗: %s", fid)
+        if resolved:
+            return resolved
+
+    # conversations.historyでメッセージを再取得してファイル情報を確認
+    # （新しいSlack APIではevent.filesが空でもAPIからは取得できる場合がある）
+    msg_ts = event.get("ts", "")
+    if msg_ts and channel_id:
+        try:
+            resp = slack_client.conversations_history(
+                channel=channel_id,
+                latest=msg_ts,
+                inclusive=True,
+                limit=1,
+            )
+            msgs = resp.get("messages", [])
+            if msgs:
+                refetched = msgs[0].get("files", [])
+                if refetched:
+                    logger.info("conversations.historyからfiles=%d件取得: %s",
+                                len(refetched),
+                                [(f.get("name"), f.get("mimetype")) for f in refetched])
+                    return refetched
+        except Exception:
+            logger.exception("conversations.historyでの再取得失敗")
+
+    if has_file_hints:
+        logger.warning("ファイルの手がかりはあったが取得できず (event_keys=%s)", sorted(event.keys()))
+    return []
+
+
+def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
+    """Slackの添付ファイル（画像のみ）をダウンロードしローカルパスのリストを返す"""
+    # mimetypeがない場合filetypeからの推定もサポート
+    _IMAGE_FILETYPES = {"jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tiff"}
+
+    def _is_image(f: dict) -> bool:
+        mime = f.get("mimetype", "")
+        if mime and mime.startswith("image/"):
+            return True
+        ft = f.get("filetype", "").lower()
+        return ft in _IMAGE_FILETYPES
+
+    image_files = [f for f in files if _is_image(f)]
+    if not image_files:
+        logger.info("添付ファイルに画像なし: %s",
+                    [(f.get("name"), f.get("mimetype"), f.get("filetype")) for f in files])
+        return []
+
+    attach_dir = os.path.join(save_dir, ".slack-attachments")
+    os.makedirs(attach_dir, exist_ok=True)
+
+    paths: list[str] = []
+    for f in image_files:
+        size = f.get("size", 0)
+        if size > MAX_SLACK_FILE_SIZE:
+            logger.warning("添付ファイルが大きすぎるためスキップ: %s (%d bytes)", f.get("name"), size)
+            continue
+
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            logger.warning("添付ファイルにダウンロードURLなし: %s (keys=%s)", f.get("name"), list(f.keys()))
+            continue
+
+        # ファイル名のスペースをアンダースコアに置換（パス解釈の問題を防止）
+        raw_name = f.get("name", "image").replace(" ", "_")
+        filename = f"{int(time.time())}_{raw_name}"
+        dest = os.path.join(attach_dir, filename)
+        try:
+            data = _download_slack_file_content(url, SLACK_BOT_TOKEN)
+            if data is None:
+                logger.warning("添付ファイルのダウンロードに失敗（無効なレスポンス）: %s", raw_name)
+                continue
+            with open(dest, "wb") as out:
+                out.write(data)
+
+            # 画像を検証・正規化（形式変換、リサイズ等）
+            normalized = _normalize_image(dest)
+            if normalized:
+                paths.append(normalized)
+                logger.info("添付画像を準備: %s", normalized)
+            else:
+                logger.warning("添付画像の正規化に失敗、スキップ: %s", raw_name)
+        except Exception:
+            logger.exception("添付ファイルのダウンロードに失敗: %s", raw_name)
+    return paths
+
+
+def _augment_prompt_with_images(prompt: str, image_paths: list[str]) -> str:
+    """画像パスをプロンプト末尾に追記"""
+    lines = "\n".join(image_paths)
+    return f"{prompt}\n\n添付画像:\n{lines}"
+
+
+# ---------------------------------------------------------------------------
+# Markdown → Slack mrkdwn 変換
+# ---------------------------------------------------------------------------
+# Claude CLI は標準 Markdown で出力するが、Slack の mrkdwn は異なる記法を使う。
+#   **bold** → *bold*,  ***bold italic*** → *_text_*,
+#   *italic* → _italic_,  ~~strike~~ → ~strike~,
+#   # Header → *Header*,  [text](url) → <url|text>,
+#   - item → • item,  table → code block,  --- → ━━━
+# コードブロック / インラインコード内部は変換しない。
+# CJK文字隣接時にゼロ幅スペース(U+200B)を挿入してSlackの書式レンダリングを保証。
+
+def _md_to_slack(text: str) -> str:
+    """標準 Markdown テキストを Slack mrkdwn 形式に変換する。"""
+    _placeholders: list[str] = []
+    ZWS = "\u200B"  # ゼロ幅スペース: Slack mrkdwn の書式境界を確保
+
+    def _ph(content: str) -> str:
+        """テキストをプレースホルダーに退避"""
+        _placeholders.append(content)
+        return f"\x00CB{len(_placeholders) - 1}\x00"
+
+    def _save(replacement: str):
+        """変換済みテキストをZWS付きプレースホルダーに退避して返す"""
+        def _inner(m: re.Match) -> str:
+            converted = replacement.replace(r"\1", m.group(1))
+            return _ph(f"{ZWS}{converted}{ZWS}")
+        return _inner
+
+    def _save_raw(m: re.Match) -> str:
+        """マッチしたテキストをそのまま退避（コードブロック用）"""
+        code = m.group(0)
+        # コードブロックの言語指定を除去（Slack では表示されるだけで意味がない）
+        if code.startswith("```"):
+            code = re.sub(r"^```\w*", "```", code)
+        return _ph(code)
+
+    # コードブロック (```...```) → 退避
+    text = re.sub(r"```[\s\S]*?```", _save_raw, text)
+    # インラインコード (`...`) → 退避
+    text = re.sub(r"`[^`\n]+`", _save_raw, text)
+
+    # Markdown テーブル（|で始まる連続行、2行以上）→ コードブロック化して退避
+    text = re.sub(
+        r"(?:^[ \t]*\|[^\n]*\|[ \t]*$\n?){2,}",
+        lambda m: _ph(f"```\n{m.group(0).rstrip()}\n```"),
+        text, flags=re.MULTILINE,
+    )
+
+    # 水平線（行全体が --- / *** / ___ 等）→ 区切り線
+    text = re.sub(r"^[ \t]*([-*_])\1{2,}[ \t]*$", "━━━━━━━━━━━━━━━━━━━━", text, flags=re.MULTILINE)
+
+    # ブロック引用: ネストされた引用 (>>, > >, ...) → 単一レベルに平坦化 (Slackは1レベルのみ)
+    text = re.sub(r"^(?:>[ \t]*){2,}", "> ", text, flags=re.MULTILINE)
+
+    # 順序なしリスト: 行頭の - / * / + → •（太字/イタリック変換前に実行）
+    text = re.sub(r"^([ \t]*)[-*+] ", r"\1• ", text, flags=re.MULTILINE)
+
+    # タスクリスト: [x]/[X] → ✅, [ ]/[] → ☐ (コードブロック退避済みなので安全)
+    text = re.sub(r"\[([xX])\]", "✅", text)
+    text = re.sub(r"\[ ?\]", "☐", text)
+
+    # --- インライン書式変換 ---
+    # ***bold italic*** → *_text_*
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", _save(r"*_\1_*"), text)
+    # **bold** / __bold__ → *bold*（退避して italic 誤変換を防止）
+    text = re.sub(r"\*\*(.+?)\*\*", _save(r"*\1*"), text)
+    text = re.sub(r"__(.+?)__", _save(r"*\1*"), text)
+    # *italic* → _italic_（ZWS付き）
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
+                  lambda m: f"{ZWS}_{m.group(1)}_{ZWS}", text)
+    # ~~strikethrough~~ → ~strikethrough~（ZWS付き）
+    text = re.sub(r"~~(.+?)~~",
+                  lambda m: f"{ZWS}~{m.group(1)}~{ZWS}", text)
+    # [text](url) → <url|text>
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+    # # Header → *Header*（行頭の # を太字に変換）
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+
+    # プレースホルダー復元（逆順: テーブル内のインラインコード等、ネストを正しく展開）
+    for i in range(len(_placeholders) - 1, -1, -1):
+        text = text.replace(f"\x00CB{i}\x00", _placeholders[i])
+
+    return text
 
 
 def _is_user_allowed(user_id: str) -> bool:
@@ -156,6 +515,7 @@ class Session:
     created_at: Optional[datetime] = None
     tasks: list[Task] = field(default_factory=list)
     next_tools: Optional[str] = None  # tools コマンドで設定、次タスク実行時に消費
+    pending_question: Optional[dict] = None  # プロセス終了後の --resume 用質問メタデータ
 
     @property
     def active_task(self) -> Optional[Task]:
@@ -443,6 +803,13 @@ def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
                     results.append(("question", formatted, meta))
                     continue
 
+            # ExitPlanMode検出（プラン承認質問として表示）
+            if tool_name == "ExitPlanMode":
+                formatted, meta = _format_exit_plan_mode(tool_input)
+                if formatted:
+                    results.append(("question", formatted, meta))
+                    continue
+
             summary = _summarize_input(tool_input) if isinstance(tool_input, dict) else str(tool_input)[:80]
             if summary:
                 results.append(("status", f":wrench: `{tool_name}` {summary}", None))
@@ -493,6 +860,7 @@ def _format_ask_user_question(tool_input: dict) -> tuple[str, dict | None]:
 
         all_parts.append("\n".join(lines))
         all_questions_meta.append({
+            "question": question_text,
             "options": option_items,
             "multi_select": multi_select,
         })
@@ -503,6 +871,51 @@ def _format_ask_user_question(tool_input: dict) -> tuple[str, dict | None]:
     formatted = "\n\n".join(all_parts)
     metadata = {"questions": all_questions_meta}
     return (formatted, metadata)
+
+
+def _format_exit_plan_mode(tool_input: dict) -> tuple[str, dict | None]:
+    """ExitPlanModeをプラン承認質問として整形。
+    tool_inputからプラン内容を抽出して表示する。"""
+    plan_text = ""
+    if isinstance(tool_input, dict):
+        # 既知のフィールドを順に探す
+        for key in ("plan", "content", "summary"):
+            val = tool_input.get(key, "")
+            if isinstance(val, str) and val.strip():
+                plan_text = val.strip()
+                break
+        # allowedPrompts の表示
+        prompts = tool_input.get("allowedPrompts", [])
+        if isinstance(prompts, list) and prompts:
+            prompt_lines = []
+            for p in prompts:
+                if isinstance(p, dict):
+                    prompt_lines.append(f"- `{p.get('tool', '?')}`: {p.get('prompt', '')}")
+            if prompt_lines:
+                plan_text += "\n\n*許可プロンプト:*\n" + "\n".join(prompt_lines)
+
+    lines = [":clipboard: *プランの承認が必要です*"]
+    if plan_text:
+        # Slack表示用にプラン内容をコードブロックで表示（長い場合は切り詰め）
+        display = plan_text
+        max_plan_len = 2500  # 質問テキスト等のオーバーヘッドを考慮
+        if len(display) > max_plan_len:
+            display = display[:max_plan_len] + "\n...(省略)"
+        lines.append(f"```\n{display}\n```")
+    lines.append("  1. 承認して実行")
+    lines.append("  2. 却下・フィードバック")
+    lines.append("_番号を返信してください（テキストでフィードバックも可）_")
+
+    metadata = {
+        "questions": [{
+            "options": [
+                {"label": "承認して実行", "description": ""},
+                {"label": "却下・フィードバック", "description": ""},
+            ],
+            "multi_select": False,
+        }]
+    }
+    return ("\n".join(lines), metadata)
 
 
 def _read_new_jsonl_entries(jsonl_path: str, file_offset: int) -> tuple[list[dict], int]:
@@ -635,7 +1048,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         last_posted_text = text
         # PTYペンディングメッセージを確定（JSONL経由で正式な応答が来たため）
         _finalize_pty_pending(inst, channel, client)
-        display = text
+        display = _md_to_slack(text)
         if len(display) > MAX_SLACK_MSG_LENGTH:
             display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
         try:
@@ -660,10 +1073,16 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         # pending_question を設定（最初の質問のみ対応）
         if metadata and metadata.get("questions"):
             q = metadata["questions"][0]
-            inst["pending_question"] = {
+            pq = {
+                "question": q.get("question", ""),
                 "options": q["options"],
                 "multi_select": q["multi_select"],
             }
+            inst["pending_question"] = pq
+            # Sessionにも保存（プロセス終了後の --resume 用）
+            session_ref = inst.get("session")
+            if session_ref:
+                session_ref.pending_question = pq
 
     while _is_process_alive(pid):
         time.sleep(TERMINAL_POLL_INTERVAL)
@@ -1722,7 +2141,7 @@ class ClaudeCodeRunner:
                 tools_summary += f" 他{len(task.tool_calls) - 10}件"
             parts.append(f"使用ツール ({len(task.tool_calls)}回): {tools_summary}")
         if show_result and task.result:
-            result_text = task.result[:MAX_SLACK_MSG_LENGTH]
+            result_text = _md_to_slack(task.result)[:MAX_SLACK_MSG_LENGTH]
             if len(task.result) > MAX_SLACK_MSG_LENGTH:
                 result_text += "\n...(省略)"
             parts.append(f"\n{result_text}")
@@ -1873,7 +2292,8 @@ def handle_message(event, say):
             return
 
         text = event.get("text", "").strip()
-        if not text:
+        files = event.get("files", [])
+        if not text and not files:
             return
 
         parent_ts = event.get("thread_ts")
@@ -1884,8 +2304,11 @@ def handle_message(event, say):
             if parent_ts in instance_threads:
                 input_text = _strip_bot_mention(text)
                 input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
-                _handle_instance_input(input_text, say, parent_ts, channel_id)
-                return
+                handled = _handle_instance_input(input_text, say, parent_ts, channel_id,
+                                                _resolve_event_files(event, channel_id))
+                if handled:
+                    return
+                # EIOでFalse返却 → instance_threads除去済み、セッション --resume パスへフォールスルー
 
             # 2. セッション存在 → --resume で新タスク自動作成（メンション不要）
             project = runner.get_project(channel_id)
@@ -1912,8 +2335,9 @@ def handle_message(event, say):
                         _handle_status(say, parent_ts, channel_id)
                         return
                     # 新タスクとして --resume 続行
+                    resolved_files = _resolve_event_files(event, channel_id)
                     _handle_thread_reply_task(
-                        input_text, project, session, say, parent_ts, user_id
+                        input_text, project, session, say, parent_ts, user_id, resolved_files
                     )
                     return
 
@@ -1937,15 +2361,68 @@ def handle_message(event, say):
         if stripped == text:
             return  # メンションなし → 無視
         text = stripped
-        if not text:
+        if not text and not files:
             return
 
         _dispatch_command(text, event, say)
 
 
+def _build_question_answer_prompt(question_text: str, options: list[dict],
+                                  selected_num: int | None, answer_label: str) -> str:
+    """質問への回答プロンプトを構築。--resume なしでもClaude が文脈を理解できるよう質問全体を含める。"""
+    parts = []
+    if question_text:
+        parts.append(f"以下の質問への回答です:\n質問: {question_text}")
+    else:
+        parts.append("前の質問への回答です:")
+    if options:
+        opts = "\n".join(
+            f"  {i+1}. {o.get('label', '')}" + (f" — {o['description']}" if o.get('description') else "")
+            for i, o in enumerate(options)
+        )
+        parts.append(f"選択肢:\n{opts}")
+    if selected_num is not None:
+        parts.append(f"回答: {selected_num}. {answer_label}")
+    else:
+        parts.append(f"回答: {answer_label}")
+    return "\n".join(parts)
+
+
 def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
-                              say, thread_ts: str, user_id: str):
+                              say, thread_ts: str, user_id: str,
+                              files: list[dict] | None = None):
     """スレッド返信を --resume で新タスクとして実行"""
+    # pending_question がある場合、回答を質問コンテキスト付きプロンプトに変換
+    pq = session.pending_question
+    if pq and not pq.get("multi_select", False):
+        options = pq.get("options", [])
+        question_text = pq.get("question", "")
+        num_match = re.match(r"^\s*(\d+)\s*$", prompt)
+        if num_match:
+            num = int(num_match.group(1))
+            if 1 <= num <= len(options):
+                label = options[num - 1].get("label", prompt)
+                prompt = _build_question_answer_prompt(question_text, options, num, label)
+        else:
+            # テキスト回答の場合もコンテキスト付与
+            prompt = _build_question_answer_prompt(question_text, options, None, prompt)
+        session.pending_question = None
+
+    # 添付画像のダウンロードとプロンプト拡張
+    if files:
+        cwd = session.working_dir or project.root_dir
+        image_paths = _download_slack_files(files, cwd)
+        if image_paths:
+            prompt = _augment_prompt_with_images(prompt, image_paths)
+
+    # セッションにclaude_session_idがまだ設定されていない場合、短時間待機
+    # （前タスクの_executeがJSONL処理中の可能性があるため）
+    if not session.claude_session_id and session.tasks:
+        for _ in range(10):
+            time.sleep(0.3)
+            if session.claude_session_id:
+                break
+
     task = Task(
         id=0,
         prompt=prompt,
@@ -2017,7 +2494,7 @@ def _dispatch_command(text: str, event: dict, say):
 
     # ── in <path> <タスク> ──
     if cmd_lower.startswith("in "):
-        _handle_in_dir(text, say, thread_ts, channel_id, user_id)
+        _handle_in_dir(text, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
         return
 
     # ── 新規タスク（bind必須） ──
@@ -2030,9 +2507,18 @@ def _dispatch_command(text: str, event: dict, say):
         return
 
     session = project.get_or_create_session(thread_ts)
+    prompt = text
+    # 添付画像のダウンロードとプロンプト拡張
+    files = _resolve_event_files(event, channel_id)
+    if files:
+        cwd = session.working_dir or project.root_dir
+        image_paths = _download_slack_files(files, cwd)
+        if image_paths:
+            prompt = _augment_prompt_with_images(prompt, image_paths)
+
     task = Task(
         id=0,
-        prompt=text,
+        prompt=prompt,
         allowed_tools=session.consume_tools(),
         user_id=user_id,
     )
@@ -2143,10 +2629,19 @@ end if
 '''
 
 
-def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
+def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
+                           files: list[dict] | None = None) -> bool:
     """インスタンススレッドへの返信をPTY書き込みまたはクリップボード+ペースト経由でターミナルに転送。
-    pending_questionがある場合は選択肢回答として処理する。"""
+    pending_questionがある場合は選択肢回答として処理する。
+    戻り値: True=処理済み, False=EIOでinstance_threadsから除去済み（呼び出し元でフォールスルーすべき）"""
     inst = instance_threads[parent_ts]
+
+    # 添付画像がある場合、ダウンロードしてテキストに画像パスを追記
+    if files:
+        cwd = inst.get("cwd", WORKING_DIR)
+        image_paths = _download_slack_files(files, cwd)
+        if image_paths:
+            text = _augment_prompt_with_images(text, image_paths)
     tty = inst.get("tty", "")
     pid = inst["pid"]
     master_fd = inst.get("master_fd")
@@ -2172,7 +2667,7 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
                         action_label = f"選択肢 {num} ({options[num - 1].get('label', '')}) を選択"
                     else:
                         say(text=f":warning: 1〜{option_count} の番号を入力してください", thread_ts=parent_ts)
-                        return
+                        return True
                 else:
                     # テキスト入力 → "Other" を選択してテキスト入力
                     pty_input = b"\x1b[B" * option_count + b"\r"
@@ -2182,11 +2677,17 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
                     action_label = f"Other: {text[:50]}"
 
                 inst.pop("pending_question", None)
+                session_ref = inst.get("session")
+                if session_ref:
+                    session_ref.pending_question = None
                 _finalize_pty_pending(inst, channel_id, slack_client)
             else:
                 # 通常のテキスト入力
                 if pending_q and pending_q.get("multi_select", False):
                     inst.pop("pending_question", None)
+                    session_ref = inst.get("session")
+                    if session_ref:
+                        session_ref.pending_question = None
                     _finalize_pty_pending(inst, channel_id, slack_client)
                 os.write(master_fd, text.encode("utf-8") + b"\r")
 
@@ -2203,12 +2704,12 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
             if is_jsonl_mode:
                 inst["input_msg_ts"] = resp["ts"]
                 inst["input_msg_text"] = msg_text
-            return
+            return True
 
         # ── TTYがない場合のエラー ──
         if not tty:
             say(text=f":warning: PID {pid} にはTTYが接続されていません", thread_ts=parent_ts)
-            return
+            return True
 
         # ── 既存のAppleScript処理（外部検出インスタンス用） ──
         tty_device = f"/dev/{tty}"
@@ -2234,7 +2735,7 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
                     action_label = f"選択肢 {num} ({options[num - 1].get('label', '')}) を選択"
                 else:
                     say(text=f":warning: 1〜{option_count} の番号を入力してください", thread_ts=parent_ts)
-                    return
+                    return True
             else:
                 # テキスト入力 → "Other" を選択してペースト
                 subprocess.run(
@@ -2247,12 +2748,18 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
 
             # pending_question をクリア
             inst.pop("pending_question", None)
+            session_ref = inst.get("session")
+            if session_ref:
+                session_ref.pending_question = None
             _finalize_pty_pending(inst, channel_id, slack_client)
         else:
             # 通常のテキスト入力（既存動作）
             # multiSelectの場合もフォールバック
             if pending_q and pending_q.get("multi_select", False):
                 inst.pop("pending_question", None)
+                session_ref = inst.get("session")
+                if session_ref:
+                    session_ref.pending_question = None
                 _finalize_pty_pending(inst, channel_id, slack_client)
 
             subprocess.run(
@@ -2297,8 +2804,15 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
                     inst["input_baseline_marker"] = baseline_marker
         else:
             say(text=f":x: 入力送信エラー: {result.stderr.strip()}", thread_ts=parent_ts)
+    except OSError as e:
+        if e.errno == 5:  # EIO — プロセス終了済み → instance_threadsから除去してフォールスルー
+            instance_threads.pop(parent_ts, None)
+            return False
+        else:
+            say(text=f":x: 入力送信エラー: {e}", thread_ts=parent_ts)
     except Exception as e:
         say(text=f":x: 入力送信エラー: {e}", thread_ts=parent_ts)
+    return True
 
 
 # Mentionイベントは無視（message.channels で処理済み）
@@ -2546,7 +3060,8 @@ def _handle_unbind(say, thread_ts, channel_id: str):
         say(text=":warning: このチャンネルにはプロジェクトルートが設定されていません", thread_ts=thread_ts)
 
 
-def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
+def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = "",
+                   files: list[dict] | None = None):
     rest = text[3:].strip()
     parts = rest.split(maxsplit=1)
     if len(parts) < 2:
@@ -2582,6 +3097,12 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     # 新セッション作成（working_dir オーバーライド付き）
     session = project.get_or_create_session(thread_ts)
     session.working_dir = dir_path
+
+    # 添付画像のダウンロードとプロンプト拡張
+    if files:
+        image_paths = _download_slack_files(files, dir_path)
+        if image_paths:
+            prompt = _augment_prompt_with_images(prompt, image_paths)
 
     task = Task(
         id=0,
