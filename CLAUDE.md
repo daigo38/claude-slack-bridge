@@ -8,7 +8,7 @@ A bridge that lets users control Claude Code (CLI) from Slack on their Mac. Mult
 
 Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for top-level messages. Thread replies to tracked sessions are forwarded without mention.
 
-Channels must be bound to project roots via `bind`/`unbind` commands before tasks can run. Unbound channels cannot execute tasks.
+Channels must be bound to project roots via `bind`/`unbind` commands before tasks can run. Unbound channels cannot execute tasks. `bind fork [PID]` bridges a running Claude CLI process into the Project+Session model — I/O forwarding while alive, `--resume` continuation after death.
 
 ## Running
 

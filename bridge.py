@@ -19,6 +19,7 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   cancel #id                → タスクをキャンセル
   cancel all                → プロジェクト内全タスクをキャンセル
   bind <path>               → チャンネルにプロジェクトルートを紐付け
+  bind fork [PID]           → 実行中のclaude CLIプロセスをフォーク
   unbind                    → プロジェクトルートの紐付けを解除
   tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
   detect                    → 実行中のclaude CLIインスタンスを検出・接続
@@ -558,19 +559,18 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     def _extract_task_info(entry: dict):
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
-        if not task_ref:
-            return
         session_ref = inst.get("session")  # Session オブジェクト参照
         entry_type = entry.get("type", "")
         msg = entry.get("message", {})
-        # session_id → Task と Session 両方に設定
+        # session_id → Session に設定（task_ref がなくても実行）
         if isinstance(msg, dict):
             sid = msg.get("session_id") or entry.get("session_id")
         else:
             sid = entry.get("session_id")
-        if sid:
-            if session_ref:
-                session_ref.claude_session_id = sid
+        if sid and session_ref:
+            session_ref.claude_session_id = sid
+        if not task_ref:
+            return
         # result type
         if entry_type == "result":
             result_data = entry.get("result", {})
@@ -778,6 +778,14 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             )
         except Exception:
             pass
+
+    # フォーク用クリーンアップ（bridge-spawned タスクは _execute の finally で既に除去済み）
+    if inst.get("session") and not inst.get("skip_exit_message"):
+        for ts, data in list(instance_threads.items()):
+            if data is inst:
+                instance_threads.pop(ts, None)
+                _save_instance_state()
+                break
 
 
 def _extract_session_info_from_jsonl(task: Task, session: Optional["Session"], jsonl_path: str):
@@ -1419,6 +1427,14 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
     except Exception:
         pass
 
+    # フォーク用クリーンアップ（bridge-spawned タスクは _execute の finally で既に除去済み）
+    if inst.get("session") and not inst.get("skip_exit_message"):
+        for ts, data in list(instance_threads.items()):
+            if data is inst:
+                instance_threads.pop(ts, None)
+                _save_instance_state()
+                break
+
 
 # ── Claude Code ランナー ──────────────────────────────────
 class ClaudeCodeRunner:
@@ -1807,6 +1823,9 @@ runner = ClaudeCodeRunner(slack_client)
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
 
+# bind fork の複数候補選択状態（channel_id → 選択情報）
+pending_fork_selections: dict[str, dict] = {}
+
 
 def _save_instance_state():
     """instance_threads の状態をファイルに永続化（bridge起動タスクはttyなしのため除外）"""
@@ -2011,6 +2030,14 @@ def handle_message(event, say):
                 _dispatch_command(stripped, event, say)
             return
 
+        # フォーク選択割り込み（メンション有無問わず、番号 or cancel のみ処理）
+        if channel_id in pending_fork_selections:
+            fork_input = _strip_bot_mention(text)
+            if fork_input == text:
+                fork_input = text  # メンションなしでもOK
+            if _handle_fork_selection(fork_input, say, channel_id):
+                return
+
         # トップレベルメッセージ: botメンション必須
         stripped = _strip_bot_mention(text)
         if stripped == text:
@@ -2061,6 +2088,11 @@ def _dispatch_command(text: str, event: dict, say):
     # ── cancel ──
     if cmd_lower.startswith("cancel"):
         _handle_cancel(text, say, thread_ts, channel_id)
+        return
+
+    # ── bind fork [PID] ──
+    if cmd_lower.startswith("bind fork"):
+        _handle_bind_fork(text, say, thread_ts, channel_id, user_id)
         return
 
     # ── bind <path> ──
@@ -2405,6 +2437,7 @@ def _help_text() -> str:
         "• `@bot cancel all` → プロジェクト内全タスクをキャンセル\n"
         "*設定:*\n"
         "• `@bot bind <path>` → チャンネルにプロジェクトルートを紐付け\n"
+        "• `@bot bind fork [PID]` → 実行中のclaude CLIプロセスをフォーク\n"
         "• `@bot unbind` → プロジェクトルートの紐付けを解除\n"
         "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定\n"
         "• `@bot detect` → 実行中のclaude CLIインスタンスを検出・接続"
@@ -2648,6 +2681,190 @@ def _handle_detect(say, thread_ts):
         text=f":mag: {registered}件の新しいclaude CLIインスタンスを検出・登録しました",
         thread_ts=thread_ts,
     )
+
+
+def _handle_bind_fork(text: str, say, thread_ts, channel_id: str, user_id: str):
+    """bind fork [PID] — 実行中のclaude CLIプロセスをこのチャンネルのProject+Sessionとしてフォーク"""
+    # "bind fork" の後の部分からPIDをパース
+    rest = text[len("bind fork"):].strip()
+    target_pid = None
+    if rest:
+        try:
+            target_pid = int(rest)
+        except ValueError:
+            say(text=":warning: PIDは数字で指定してください: `bind fork [PID]`", thread_ts=thread_ts)
+            return
+
+    # 実行中のclaude CLIプロセスを検出
+    instances = detect_running_claude_instances()
+    if not instances:
+        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
+        return
+
+    # 既に instance_threads で追跡中のPIDを除外
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids]
+
+    if not candidates:
+        say(
+            text=f":mag: フォーク可能なインスタンスがありません（{len(tracked_pids)}件追跡中）",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # PID指定あり → 直接実行
+    if target_pid is not None:
+        matched = [i for i in candidates if i["pid"] == target_pid]
+        if not matched:
+            # 追跡中のものも含めて確認
+            if target_pid in tracked_pids:
+                say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
+            else:
+                say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
+            return
+        _execute_bind_fork(matched[0], channel_id, say, thread_ts, user_id)
+        return
+
+    # 1件 → 自動選択
+    if len(candidates) == 1:
+        _execute_bind_fork(candidates[0], channel_id, say, thread_ts, user_id)
+        return
+
+    # 複数件 → 番号リスト投稿 + pending_fork_selections に状態保存
+    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
+    for i, inst in enumerate(candidates, 1):
+        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
+    say(text="\n".join(lines), thread_ts=thread_ts)
+
+    pending_fork_selections[channel_id] = {
+        "instances": candidates,
+        "thread_ts": thread_ts,
+        "user_id": user_id,
+    }
+
+
+def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str):
+    """フォーク実行: Project+Session作成、instance_threads登録、監視開始"""
+    pid = inst["pid"]
+    cwd = inst["cwd"]
+
+    # 1. Project 作成/更新
+    project = runner.bind_project(channel_id, cwd)
+
+    # 2. Slack にフォーク開始メッセージ投稿 → fork_thread_ts 取得
+    try:
+        resp = say(
+            text=(
+                f":fork_and_knife: *bind fork* — PID {pid} をこのチャンネルにフォーク\n"
+                f":file_folder: `{cwd}`\n"
+                f":clock1: 経過: {inst.get('etime', '?')}\n"
+                f"_このスレッドに返信するとclaude CLIに入力を送信します_"
+            ),
+            thread_ts=None,  # トップレベルメッセージとして投稿
+        )
+        fork_thread_ts = resp["ts"]
+    except Exception as e:
+        logger.error("フォーク開始メッセージの投稿に失敗: %s", e)
+        say(text=f":x: フォーク開始メッセージの投稿に失敗しました: {e}", thread_ts=thread_ts)
+        return
+
+    # 3. Session 作成
+    session = project.get_or_create_session(fork_thread_ts)
+
+    # 4. JSONL があれば session_id を抽出
+    jsonl_path = _find_session_jsonl(cwd)
+    if jsonl_path:
+        # task は無いので、session_id 抽出のみを行う簡易パス
+        # _extract_session_info_from_jsonl は task が必須なのでダミー Task を使う
+        dummy_task = Task(id=0, prompt="(fork)")
+        _extract_session_info_from_jsonl(dummy_task, session, jsonl_path)
+
+    # 5. instance_threads に登録（session 参照付き、task なし）
+    thread_data = {
+        "pid": pid,
+        "tty": inst.get("tty", ""),
+        "cwd": cwd,
+        "session": session,
+        # task なし = フォークインスタンス
+    }
+
+    if jsonl_path:
+        # JSONL監視モード
+        thread_data["jsonl_path"] = jsonl_path
+        monitor_target = _monitor_session_jsonl
+    else:
+        # ターミナル監視にフォールバック
+        tty_device = f"/dev/{inst.get('tty', '')}"
+        initial_content = _read_terminal_contents(tty_device) or ""
+        thread_data["passive_baseline_len"] = len(initial_content)
+        thread_data["passive_baseline_marker"] = initial_content[-500:] if len(initial_content) >= 500 else initial_content
+        monitor_target = _monitor_terminal_output
+
+    instance_threads[fork_thread_ts] = thread_data
+
+    # 6. 監視スレッド起動
+    monitor = threading.Thread(
+        target=monitor_target,
+        args=(thread_data, fork_thread_ts, channel_id, slack_client),
+        daemon=True,
+    )
+    monitor.start()
+
+    # 7. 永続化
+    _save_instance_state()
+
+    # 8. 完了通知
+    monitor_label = "JSONL" if jsonl_path else "Terminal"
+    sid_info = f"\n_Session: `{session.claude_session_id[:12]}...`_" if session.claude_session_id else ""
+    say(
+        text=(
+            f":white_check_mark: PID {pid} をフォークしました\n"
+            f":link: プロジェクトルート: `{cwd}`\n"
+            f":mag: 監視: {monitor_label}{sid_info}"
+        ),
+        thread_ts=thread_ts,
+    )
+
+
+def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
+    """pending_fork_selections の番号選択/キャンセルを処理。
+    処理した場合 True、fallthrough の場合 False を返す。"""
+    if channel_id not in pending_fork_selections:
+        return False
+
+    selection = pending_fork_selections[channel_id]
+    instances = selection["instances"]
+    thread_ts = selection["thread_ts"]
+    user_id = selection["user_id"]
+    input_text = text.strip().lower()
+
+    # cancel
+    if input_text == "cancel":
+        del pending_fork_selections[channel_id]
+        say(text=":x: フォーク選択をキャンセルしました", thread_ts=thread_ts)
+        return True
+
+    # 番号入力
+    try:
+        num = int(input_text)
+    except ValueError:
+        return False  # 数字でもcancelでもない → 通常のコマンド処理にfallthrough
+
+    if num < 1 or num > len(instances):
+        say(text=f":warning: 1〜{len(instances)} の番号を入力してください", thread_ts=thread_ts)
+        return True
+
+    selected = instances[num - 1]
+    del pending_fork_selections[channel_id]
+
+    # プロセス死亡チェック
+    if not _is_process_alive(selected["pid"]):
+        say(text=f":warning: PID {selected['pid']} は既に終了しています", thread_ts=thread_ts)
+        return True
+
+    _execute_bind_fork(selected, channel_id, say, thread_ts, user_id)
+    return True
 
 
 # ── エントリーポイント ────────────────────────────────────
