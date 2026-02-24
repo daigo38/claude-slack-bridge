@@ -3,8 +3,7 @@
 Mac上で動くClaude Codeを、Slackから監視・操作するブリッジ。
 複数タスクの同時実行に対応。
 
-- **DMモード**: 管理者がスマホからDMで操作（メンション不要）
-- **チャンネルモード**: チームメンバーがチャンネルで `@bot` メンションして操作
+チャンネルで `@bot` メンションしてClaude Codeを操作します。チャンネルとプロジェクトルートを紐付けることで、ホストのディレクトリ構造を意識せず相対パスだけで操作できます。
 
 ## こんなとき便利
 
@@ -17,19 +16,19 @@ Mac上で動くClaude Codeを、Slackから監視・操作するブリッジ。
 
 このツールはSlack経由で **ローカルMac上のClaude Code（=シェル実行が可能なCLI）をリモート操作** します。以下の点を理解した上でご利用ください。
 
-- **管理者**: `.env` の `ADMIN_SLACK_USER_ID` に設定したユーザーのみがDMモードを使用できます
-- **チャンネルモード**: `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` で許可されたユーザー・チャンネルのみ応答します。`*`（全許可）を設定する場合は、botが意図しないチャンネルに招待されるリスクに注意してください
+- **管理者**: `.env` の `ADMIN_SLACK_USER_ID` に設定したユーザーは常にアクセスが許可されます
+- **アクセス制御**: `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` で許可されたユーザー・チャンネルのみ応答します。`*`（全許可）を設定する場合は、botが意図しないチャンネルに招待されるリスクに注意してください
 - **トークン管理**: `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` が漏洩すると、第三者がBotを通じてClaude Codeを操作できる可能性があります。`.env` ファイルの権限を適切に設定し、Gitにコミットしないでください
 - **許可ツールの設定**: `DEFAULT_ALLOWED_TOOLS` はClaude Codeが自動承認するツールを制御します。`Bash(*)` を設定すると任意のシェルコマンドが自動実行されます。必要最小限のツールのみ許可することを推奨します
 - **自分のMac専用**: 共有サーバーやCI環境での利用は想定していません
-- **共有設定**: `cd` や `tools` コマンドの設定はプロセス全体で共有されます。チャンネルモードでは他のユーザーの設定変更が自分のタスクに影響する場合があります
+- **共有設定**: `tools` コマンドの設定はプロセス全体で共有されます。ユーザーAが `tools` を設定した直後にユーザーBがタスクを投入すると、Bのタスクがその設定を消費する可能性があります
 
 ## 仕組み
 
 ```
 ┌──────────┐   Socket Mode    ┌───────────────┐    subprocess ×N   ┌────────────┐
 │  あなた   │ ─────────────► │               │ ──────────────► │ Claude Code│
-│ (スマホ)  │   DM / Channel  │    Bridge     │                  │   (CLI)    │
+│ (スマホ)  │    Channel      │    Bridge     │                  │   (CLI)    │
 └──────────┘                  │  (Mac上で動作)  │ ──────────────► ├────────────┤
                               │               │                  │ Claude Code│
                               └───────────────┘                  │   (CLI)    │
@@ -53,20 +52,13 @@ Mac上で動くClaude Codeを、Slackから監視・操作するブリッジ。
 #### Bot Token Scopes を追加
 1. 左メニュー **OAuth & Permissions** → **Scopes** → **Bot Token Scopes** に以下を追加:
    - `chat:write` — メッセージ送信
-   - `im:history` — DM履歴読み取り
-   - `im:write` — DM送信
-   - `files:write` — ファイル送信（結果が大きい場合用）
-
-チャンネルモードを使う場合は追加で:
    - `channels:history` — パブリックチャンネルのメッセージ読み取り
    - `groups:history` — プライベートチャンネルのメッセージ読み取り
+   - `files:write` — ファイル送信（結果が大きい場合用）
 
 #### Event Subscriptions を設定
 1. 左メニュー **Event Subscriptions** → **Enable Events**
 2. **Subscribe to bot events** に以下を追加:
-   - `message.im`
-
-チャンネルモードを使う場合は追加で:
    - `message.channels` — パブリックチャンネルのメッセージ
    - `message.groups` — プライベートチャンネルのメッセージ
 
@@ -101,7 +93,15 @@ SLACK_APP_TOKEN=xapp-1-xxxxxxxxxxxx-xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # 自分のプロフィール → … → Copy member ID
 ADMIN_SLACK_USER_ID=U0123456789
 
-# Claude Code の作業ディレクトリ
+# アクセス制御
+SLACK_ALLOWED_USERS=U1111111111,U2222222222   # 特定ユーザーのみ（"*" で全許可）
+SLACK_ALLOWED_CHANNELS=C3333333333             # 特定チャンネルのみ（"*" で全許可）
+
+# 通知チャンネル（起動/停止通知の送信先、任意）
+# NOTIFICATION_CHANNEL=C1234567890
+
+# Claude Code のデフォルト作業ディレクトリ
+# チャンネルごとに bind コマンドで上書き可能
 WORKING_DIR=/Users/yourname/projects/my-project
 
 # 自動承認ツール（プロジェクトに合わせて調整）
@@ -116,49 +116,50 @@ DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
 python bridge.py
 ```
 
-起動するとDMに通知が届きます:
+`NOTIFICATION_CHANNEL` を設定している場合、そのチャンネルに起動通知が届きます:
 > :rocket: **Claude Code Bridge が起動しました**
 > デフォルト作業ディレクトリ: `/Users/yourname/projects/my-project`
 
-## 使い方（DMモード）
+## 使い方
 
-BotにDMを送信するだけ。`@bot` のメンションは不要です。管理者のみ利用可能。
-
-## 使い方（チャンネルモード）
-
-`.env` で `SLACK_ALLOWED_USERS` と `SLACK_ALLOWED_CHANNELS` を設定した上で、botをチャンネルに招待します。チャンネルでは `@bot` メンション付きでコマンドを送信します。
-
-```bash
-# .env の設定例
-SLACK_ALLOWED_USERS=U1111111111,U2222222222   # 特定ユーザーのみ
-SLACK_ALLOWED_CHANNELS=C3333333333             # 特定チャンネルのみ
-
-# または全許可
-SLACK_ALLOWED_USERS=*
-SLACK_ALLOWED_CHANNELS=*
-```
-
-タスクのSlackスレッドへの返信はメンション不要でCLIに転送されます。
+botをチャンネルに招待し、`@bot` メンション付きでコマンドを送信します。タスクのSlackスレッドへの返信はメンション不要でCLIに転送されます。
 
 ### コマンド一覧
 
 | コマンド | 説明 |
 |---------|------|
-| `<タスク内容>` | 新しいタスクを実行 |
-| `in ~/other-project テスト書いて` | 指定ディレクトリで実行 |
-| `continue テストも追加して` | 直前セッションを続行 |
-| `continue #2 エラーを修正して` | 指定タスクのセッションを続行 |
-| `resume <session_id> エラーを修正して` | 指定セッションを再開 |
-| `status` | 全タスクの状態一覧 |
-| `cancel #2` | タスクをキャンセル |
-| `cancel all` | 全タスクをキャンセル |
-| `cd /path/to/project` | 作業ディレクトリを変更 |
-| `tools Read,Write,Bash(*)` | 次タスクの許可ツールを設定 |
-| `sessions` | セッション履歴 |
-| `detect` | 実行中のclaude CLIインスタンスを検出・接続 |
-| `help` | ヘルプ表示 |
+| `@bot <タスク内容>` | 新しいタスクを実行 |
+| `@bot in src/subdir タスク` | 指定ディレクトリで実行（相対パスはプロジェクトルート基準） |
+| `@bot continue テストも追加して` | 直前セッションを続行 |
+| `@bot continue #2 エラーを修正して` | 指定タスクのセッションを続行 |
+| `@bot resume <session_id> エラーを修正して` | 指定セッションを再開 |
+| `@bot status` | 全タスクの状態一覧 |
+| `@bot cancel #2` | タスクをキャンセル |
+| `@bot cancel all` | 全タスクをキャンセル |
+| `@bot bind /path/to/project` | チャンネルにプロジェクトルートを紐付け |
+| `@bot unbind` | プロジェクトルートの紐付けを解除 |
+| `@bot tools Read,Write,Bash(*)` | 次タスクの許可ツールを設定 |
+| `@bot sessions` | セッション履歴 |
+| `@bot detect` | 実行中のclaude CLIインスタンスを検出・接続 |
+| `@bot help` | ヘルプ表示 |
 
-チャンネルモードでは各コマンドの前に `@bot` が必要です（例: `@bot status`）。
+### チャンネルとプロジェクトの紐付け
+
+`bind` コマンドでチャンネルにプロジェクトルートを紐付けると、そのチャンネルから実行するタスクは常にそのディレクトリで動きます。紐付けは `channel_projects.json` に永続化され、Bridge再起動後も維持されます。
+
+```
+@bot bind /Users/yourname/projects/my-api
+→ このチャンネルのプロジェクトルートを設定しました: /Users/yourname/projects/my-api
+
+@bot エラーハンドリングを改善して
+→ /Users/yourname/projects/my-api で実行
+
+@bot in src/tests テスト書いて
+→ /Users/yourname/projects/my-api/src/tests で実行（相対パス解決）
+
+@bot unbind
+→ プロジェクトルートの紐付けを解除しました
+```
 
 ### 典型的なワークフロー
 
@@ -166,11 +167,11 @@ SLACK_ALLOWED_CHANNELS=*
 `continue` するとスレッド内に続行メッセージが追加され、会話の流れが一目でわかります。
 
 ```
-あなた: エラーハンドリングを改善して
+あなた: @bot エラーハンドリングを改善して
 
-━━ DM ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━ チャンネル ━━━━━━━━━━━━━━━━━━━━━━━━
   🔵 #1  タスク開始
-  📂 api
+  📂 my-api
   └─ スレッド (3件)
      ├─ 🔵 #1  ⏳ 実行中... ツール: Read → Edit
      ├─ 🔵 #1  ✅ タスク完了 (45秒)
@@ -190,11 +191,11 @@ SLACK_ALLOWED_CHANNELS=*
 `detect` コマンドを使うと、Mac上で既に動いているClaude CLIプロセスを検出し、Slackスレッドから操作できるようになります。
 
 ```
-あなた: detect
-Bot:    🔍 2件の新しいclaude CLIインスタンスを検出・登録しました
+@bot detect
+→ 🔍 2件の新しいclaude CLIインスタンスを検出・登録しました
 ```
 
-検出されたインスタンスごとにスレッドが作成され、スレッドに返信することでそのCLIに入力を送れます。Bridge起動時にも自動検出が行われます。
+検出されたインスタンスごとにスレッドが作成され、スレッドに返信することでそのCLIに入力を送れます。`NOTIFICATION_CHANNEL` を設定している場合、Bridge起動時にも自動検出が行われます。
 
 ## 許可ツールの設定
 
@@ -213,11 +214,11 @@ DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(*),TodoWrite,WebSearch,WebF
 
 `tools` コマンドで一時的に変更も可能（次の1タスクのみ有効）:
 ```
-tools Read,Write,Edit,Bash(*)
-npm run build の結果を見てエラーを修正して
+@bot tools Read,Write,Edit,Bash(*)
+@bot npm run build の結果を見てエラーを修正して
 ```
 
-> **注意（チャンネルモード）:** `tools` コマンドの設定はプロセス全体で共有されます。ユーザーAが `tools` を設定した直後にユーザーBがタスクを投入すると、Bのタスクがその設定を消費する可能性があります。
+> **注意:** `tools` コマンドの設定はプロセス全体で共有されます。ユーザーAが `tools` を設定した直後にユーザーBがタスクを投入すると、Bのタスクがその設定を消費する可能性があります。
 
 ## トラブルシューティング
 
@@ -227,8 +228,10 @@ npm run build の結果を見てエラーを修正して
 - `pip install -r requirements.txt` でパッケージがインストール済みか確認
 
 ### Bot が反応しない
-- **DMモード**: BotにDMを送っているか確認。`.env` の `ADMIN_SLACK_USER_ID` が自分のIDか確認
-- **チャンネルモード**: `SLACK_ALLOWED_USERS` と `SLACK_ALLOWED_CHANNELS` が設定されているか確認。`message.channels` イベントが購読されているか確認。botがチャンネルに招待されているか確認
+- `SLACK_ALLOWED_USERS` と `SLACK_ALLOWED_CHANNELS` が設定されているか確認
+- `message.channels` イベントが購読されているか確認
+- botがチャンネルに招待されているか確認
+- `@bot` メンションを付けているか確認
 - ターミナルにエラーが出ていないか確認
 
 ### Claude Code がエラーになる
