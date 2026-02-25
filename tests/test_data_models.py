@@ -111,6 +111,13 @@ class TestSession:
 # ── Project ───────────────────────────────────────────────
 
 class TestProject:
+    def test_create_without_root_dir(self):
+        """root_dir なしで Project を作成できる"""
+        project = bridge.Project(channel_id="C999")
+        assert project.channel_id == "C999"
+        assert project.root_dir is None
+        assert project.sessions == {}
+
     def test_assign_label_first(self, make_project, make_session):
         project = make_project()
         session = make_session()

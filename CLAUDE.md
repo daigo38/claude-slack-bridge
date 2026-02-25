@@ -8,7 +8,10 @@ A bridge that lets users control Claude Code (CLI) from Slack on their Mac. Mult
 
 Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for top-level messages. Thread replies to tracked sessions are forwarded without mention.
 
-Channels must be bound to project roots via `bind`/`unbind` commands before tasks can run. Unbound channels cannot execute tasks. `bind -p <PID>` bridges a running Claude CLI process into the Project+Session model — I/O forwarding while alive, `--resume` continuation after death.
+Tasks are started with a directory specified at invocation time via three methods:
+- `@bot in <path> <task>` — run in specified directory
+- `@bot fork <PID> [<task>]` — fork a running Claude CLI process
+- `@bot <task>` — select from fork candidates / directory history in a thread
 
 ## Running
 
@@ -18,7 +21,7 @@ pip install -r requirements.txt
 python bridge.py
 ```
 
-Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ADMIN_SLACK_USER_ID`. Optional: `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `NOTIFICATION_CHANNEL`, `WORKING_DIR`, `CLAUDE_CMD`, `DEFAULT_ALLOWED_TOOLS`, `LOG_LEVEL`.
+Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ADMIN_SLACK_USER_ID`. Optional: `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `NOTIFICATION_CHANNEL`, `CLAUDE_CMD`, `DEFAULT_ALLOWED_TOOLS`, `LOG_LEVEL`.
 
 ## Architecture
 
@@ -26,29 +29,31 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 ### Data Model (3-Layer Hierarchy)
 
-- **`Project`** (= Slack Channel) — Created by `bind`, requires `root_dir` (absolute path). Contains sessions. `unbind` removes the project. `ClaudeCodeRunner.projects` dict maps `channel_id → Project`.
+- **`Project`** (= Slack Channel) — Session container. Created automatically when a task starts. `ClaudeCodeRunner.projects` dict maps `channel_id → Project`.
 
-- **`Session`** (= Slack Thread) — Created automatically when a task starts. Contains a serial chain of tasks. Holds `claude_session_id` (for `--resume`), label (emoji + name), optional `working_dir` override, and `next_tools` (one-shot tool overrides). Sessions are volatile (not persisted).
+- **`Session`** (= Slack Thread) — Created automatically when a task starts. Contains a serial chain of tasks. Holds `claude_session_id` (for `--resume`), label (emoji + name), `working_dir` (required, set at task creation), and `next_tools` (one-shot tool overrides). Sessions are volatile (not persisted).
 
 - **`Task`** (= Single Instruction → Completion) — One Claude Code subprocess invocation. Holds process handle, PTY master fd, tool call history, and `user_id`. Tasks within a session run serially. Thread replies automatically create new tasks with `--resume`.
 
 ### Key Components
 
-- **`ClaudeCodeRunner`** — Core manager. `projects` dict replaces the old `active_tasks`/`task_history`. Handles project bind/unbind, task execution, and persistence. `run_task(project, session, task)` starts a daemon thread. `_execute(project, session, task)` derives channel_id, thread_ts, and cwd from the project/session hierarchy.
+- **`ClaudeCodeRunner`** — Core manager. `projects` dict maps channels to projects. `get_or_create_project(channel_id)` creates projects on demand. Manages directory history per channel. `run_task(project, session, task)` starts a daemon thread. `_execute(project, session, task)` uses `session.working_dir` as cwd.
 
 - **Access control** — `_is_user_allowed()` and `_is_channel_allowed()` check whitelists. `ADMIN_SLACK_USER_ID` is always allowed. `*` means allow all.
 
-- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → forward to CLI, (2) session exists with no active task → auto-resume via new task, (3) session exists with active task → forward to PTY. `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
+- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → forward to CLI, (1.5) `pending_directory_requests` → directory selection, (2) session exists → auto-resume via new task, (3) fallback to command. `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
 
 - **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications. If unset, these are logged only.
 
-- **bind -p** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. `bind -p <PID>` integrates a running process into the Project+Session model with I/O forwarding while alive and `--resume` continuation after death.
+- **fork** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. `fork <PID>` integrates a running process into the Project+Session model with I/O forwarding while alive and `--resume` continuation after death.
+
+- **Bare task** — When `@bot <task>` is sent without `in` or `fork`, `_handle_bare_task` shows fork candidates and directory history for selection. Selection state is stored in `pending_directory_requests`.
 
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`
 2. Channel/user whitelist check → mention detection / thread reply routing → command parsing
-3. `_dispatch_command` parses the command. For new tasks: gets/creates Project + Session, creates Task → `runner.run_task(project, session, task)` starts a daemon thread
+3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
 4. Thread spawns `claude -p --verbose` subprocess with PTY, pipes prompt via stdin. Thread replies to existing sessions automatically use `--resume <session.claude_session_id>`
 5. JSONL output file is monitored for progress; session's `claude_session_id` is updated from JSONL entries
 6. On completion/failure, posts final result to Slack thread
@@ -59,7 +64,7 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 
 ### Persistence
 
-- `channel_projects.json` — Project `channel_id → root_dir` mapping only. Format unchanged from the old `_channel_projects` dict.
+- `directory_history.json` — Per-channel directory usage history (channel_id → [dir_path, ...]). Max 10 entries per channel.
 - Sessions and Tasks are volatile (in-memory only, lost on bridge restart).
 
 ## Language

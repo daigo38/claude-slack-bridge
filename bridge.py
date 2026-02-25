@@ -6,22 +6,20 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
 複数タスクの同時実行に対応。チャンネルモードのみ（@bot メンション必須）。
 
 3層データモデル:
-  Project (= Slack Channel) — bind でプロジェクトルートを設定
+  Project (= Slack Channel) — セッションのコンテナ
   Session (= Slack Thread)  — Project 内で並列。タスクの直列チェーン
   Task    (= 指示→完了)     — Session 内で直列。スレッド返信で自動 --resume
 
 コマンド:
-  <タスク内容>              → 新しいセッション＋タスクを実行（bind必須）
+  in <path> <タスク>        → 指定ディレクトリでタスクを実行
+  fork <PID> [<タスク>]     → 実行中のclaude CLIプロセスをフォーク
+  fork                      → フォーク可能なプロセス一覧
+  <タスク内容>              → ディレクトリ選択画面からタスクを実行
   (スレッド返信) <指示>     → 同セッションで --resume 続行
-  in <path> <タスク>        → 指定ディレクトリでセッション作成＋タスクを実行
-  status                    → プロジェクト内タスクの状態一覧
-  sessions                  → プロジェクト内セッション一覧
+  status                    → タスクの状態一覧
+  sessions                  → セッション一覧
   cancel #id                → タスクをキャンセル
-  cancel all                → プロジェクト内全タスクをキャンセル
-  bind                      → usage表示＋バインド可能なプロセスリスト
-  bind -d <path>            → チャンネルにプロジェクトルートを紐付け
-  bind -p <PID>             → 実行中のclaude CLIプロセスをフォーク
-  unbind                    → プロジェクトルートの紐付けを解除
+  cancel all                → 全タスクをキャンセル
   tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
   help                      → ヘルプ表示
 """
@@ -81,7 +79,6 @@ SLACK_ALLOWED_CHANNELS = os.getenv("SLACK_ALLOWED_CHANNELS", "")
 # 通知チャンネル（起動/停止通知の送信先。未設定ならログのみ）
 NOTIFICATION_CHANNEL = os.getenv("NOTIFICATION_CHANNEL", "")
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "claude")
-WORKING_DIR = os.getenv("WORKING_DIR", os.getcwd())
 DEFAULT_ALLOWED_TOOLS = os.getenv(
     "DEFAULT_ALLOWED_TOOLS",
     "Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite",
@@ -89,7 +86,8 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
 
 MAX_SLACK_MSG_LENGTH = 3000
 MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-CHANNEL_PROJECTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_projects.json")
+DIRECTORY_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "directory_history.json")
+DIRECTORY_HISTORY_MAX = 10
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +541,9 @@ class Session:
 
 @dataclass
 class Project:
-    """Slackチャンネル = 1プロジェクト。bind で作成、ルートディレクトリ必須。"""
+    """Slackチャンネル = 1プロジェクト。セッションのコンテナ。"""
     channel_id: str                   # Slackチャンネル = 識別子
-    root_dir: str                     # プロジェクトルート（絶対パス、必須）
+    root_dir: Optional[str] = None    # レガシー互換（未使用）
     sessions: dict[str, Session] = field(default_factory=dict)
 
     def assign_label(self, session: Session):
@@ -1880,55 +1878,52 @@ class ClaudeCodeRunner:
         self.projects: dict[str, Project] = {}  # channel_id → Project
         self.lock = threading.Lock()
         self._task_counter = 0
+        self.directory_history: dict[str, list[str]] = {}  # channel_id → [dir_path, ...]
 
     def _next_id(self) -> int:
         self._task_counter += 1
         return self._task_counter
 
     # ── プロジェクト管理 ──
-    def bind_project(self, channel_id: str, root_dir: str) -> Project:
-        """チャンネルにプロジェクトルートを紐付け"""
-        if channel_id in self.projects:
-            self.projects[channel_id].root_dir = root_dir
-        else:
-            self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
-        self.save_projects()
+    def get_or_create_project(self, channel_id: str) -> Project:
+        """チャンネルのProjectを取得、なければ作成"""
+        if channel_id not in self.projects:
+            self.projects[channel_id] = Project(channel_id=channel_id)
         return self.projects[channel_id]
-
-    def unbind_project(self, channel_id: str) -> Optional[str]:
-        """プロジェクトルートの紐付けを解除。旧パスを返す。"""
-        project = self.projects.pop(channel_id, None)
-        if project:
-            self.save_projects()
-            return project.root_dir
-        return None
 
     def get_project(self, channel_id: str) -> Optional[Project]:
         return self.projects.get(channel_id)
 
-    def save_projects(self):
-        """Project の channel_id→root_dir のみ永続化（channel_projects.json 形式）"""
-        data = {p.channel_id: p.root_dir for p in self.projects.values()}
-        try:
-            with open(CHANNEL_PROJECTS_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning("チャンネルプロジェクト設定の保存に失敗: %s", e)
+    # ── ディレクトリ履歴 ──
+    def record_directory(self, channel_id: str, dir_path: str):
+        """チャンネルのディレクトリ使用履歴を記録"""
+        history = self.directory_history.setdefault(channel_id, [])
+        # 既存エントリを先頭に移動
+        if dir_path in history:
+            history.remove(dir_path)
+        history.insert(0, dir_path)
+        # 上限を超えたら古いものを削除
+        if len(history) > DIRECTORY_HISTORY_MAX:
+            del history[DIRECTORY_HISTORY_MAX:]
+        self.save_directory_history()
 
-    def load_projects(self):
-        """channel_projects.json からプロジェクトを読み込み"""
+    def save_directory_history(self):
+        """ディレクトリ履歴を永続化"""
         try:
-            with open(CHANNEL_PROJECTS_FILE, "r") as f:
-                data = json.load(f)
-            for channel_id, root_dir in data.items():
-                if channel_id not in self.projects:
-                    self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
-                else:
-                    self.projects[channel_id].root_dir = root_dir
+            with open(DIRECTORY_HISTORY_FILE, "w") as f:
+                json.dump(self.directory_history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("ディレクトリ履歴の保存に失敗: %s", e)
+
+    def load_directory_history(self):
+        """ディレクトリ履歴を読み込み"""
+        try:
+            with open(DIRECTORY_HISTORY_FILE, "r") as f:
+                self.directory_history = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         except Exception as e:
-            logger.warning("チャンネルプロジェクト設定の読み込みに失敗: %s", e)
+            logger.warning("ディレクトリ履歴の読み込みに失敗: %s", e)
 
     # ── タスク検索 ──
     def find_task_globally(self, task_id: int) -> Optional[tuple[Project, Session, Task]]:
@@ -1972,7 +1967,14 @@ class ClaudeCodeRunner:
         return None
 
     def _execute(self, project: Project, session: Session, task: Task):
-        cwd = session.working_dir or project.root_dir
+        cwd = session.working_dir
+        if not cwd:
+            # Safety net（新フローでは到達しないはず）
+            task.status = TaskStatus.FAILED
+            task.error = "作業ディレクトリが未設定です"
+            task.completed_at = datetime.now()
+            self._post_to_session(session, f"{session.label_emoji} {task.short_id}  :x: 作業ディレクトリが未設定です")
+            return
         channel_id = session.channel_id
         thread_ts = session.thread_ts
         task.status = TaskStatus.RUNNING
@@ -2164,10 +2166,8 @@ class ClaudeCodeRunner:
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
                        show_result: bool = True) -> str:
-        cwd = session.working_dir or session.channel_id
-        # project から root_dir を取得
-        project = self.projects.get(session.channel_id)
-        dir_name = os.path.basename(project.root_dir if project else cwd)
+        cwd = session.working_dir or "(unknown)"
+        dir_name = os.path.basename(cwd)
         display_label = f"{session.label_emoji} {task.short_id}"
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
         parts = [f"{display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`{user_info}"]
@@ -2276,8 +2276,11 @@ runner = ClaudeCodeRunner(slack_client)
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
 
-# bind -p / bind（引数なし）の複数候補選択状態（channel_id → 選択情報）
+# fork の複数候補選択状態（channel_id → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
+
+# ベアタスクのディレクトリ選択待ち状態（thread_ts → 選択情報）
+pending_directory_requests: dict[str, dict] = {}
 
 
 BOT_USER_ID = None
@@ -2345,6 +2348,14 @@ def handle_message(event, say):
                 if handled:
                     return
                 # EIOでFalse返却 → instance_threads除去済み、セッション --resume パスへフォールスルー
+
+            # 1.5. ディレクトリ選択待ち → 選択処理
+            if parent_ts in pending_directory_requests:
+                input_text = _strip_bot_mention(text)
+                if not input_text:
+                    input_text = text
+                if _handle_directory_selection(input_text, say, parent_ts):
+                    return
 
             # 2. セッション存在 → --resume で新タスク自動作成（メンション不要）
             project = runner.get_project(channel_id)
@@ -2453,9 +2464,8 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
         session.pending_question = None
 
     # 添付画像のダウンロードとプロンプト拡張
-    if files:
-        cwd = session.working_dir or project.root_dir
-        image_paths = _download_slack_files(files, cwd)
+    if files and session.working_dir:
+        image_paths = _download_slack_files(files, session.working_dir)
         if image_paths:
             prompt = _augment_prompt_with_images(prompt, image_paths)
 
@@ -2512,19 +2522,18 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_cancel(text, say, thread_ts, channel_id)
         return
 
-    # ── bind [-d <path> | -p <PID>] ──
-    if cmd_lower == "bind" or cmd_lower.startswith("bind "):
-        _handle_bind(text, say, thread_ts, channel_id, user_id)
-        return
-
-    # ── unbind ──
-    if cmd_lower == "unbind":
-        _handle_unbind(say, thread_ts, channel_id)
-        return
-
     # ── sessions ──
     if cmd_lower == "sessions":
         _handle_sessions(say, thread_ts, channel_id)
+        return
+
+    # ── fork [<PID>] [<task>] ──
+    if cmd_lower == "fork" or cmd_lower.startswith("fork "):
+        rest = text[4:].strip()
+        if not rest:
+            _handle_fork_list(say, thread_ts, channel_id, user_id)
+        else:
+            _handle_fork(rest, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
         return
 
     # ── tools <list> （トップレベルではエラー） ──
@@ -2548,34 +2557,8 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_in_dir(text, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
         return
 
-    # ── 新規タスク（bind必須） ──
-    project = runner.get_project(channel_id)
-    if not project:
-        say(
-            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind -d <path>` でプロジェクトルートを設定してください。",
-            thread_ts=thread_ts,
-        )
-        return
-
-    session = project.get_or_create_session(thread_ts)
-    prompt = text
-    # 添付画像のダウンロードとプロンプト拡張
-    files = _resolve_event_files(event, channel_id)
-    if files:
-        cwd = session.working_dir or project.root_dir
-        image_paths = _download_slack_files(files, cwd)
-        if image_paths:
-            prompt = _augment_prompt_with_images(prompt, image_paths)
-
-    task = Task(
-        id=0,
-        prompt=prompt,
-        allowed_tools=session.consume_tools(),
-        user_id=user_id,
-    )
-    err = runner.run_task(project, session, task)
-    if err:
-        say(text=err, thread_ts=thread_ts)
+    # ── ベアタスク → ディレクトリ選択 or 履歴から自動 ──
+    _handle_bare_task(text, event, say, channel_id, user_id)
 
 
 def _build_terminal_focus_script(tty_device: str) -> str:
@@ -2689,7 +2672,7 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
 
     # 添付画像がある場合、ダウンロードしてテキストに画像パスを追記
     if files:
-        cwd = inst.get("cwd", WORKING_DIR)
+        cwd = inst.get("cwd", os.getcwd())
         image_paths = _download_slack_files(files, cwd)
         if image_paths:
             text = _augment_prompt_with_images(text, image_paths)
@@ -2876,19 +2859,17 @@ def _help_text() -> str:
     return (
         ":robot_face: *Claude Code Bridge* — 使い方:\n"
         "*基本操作:*\n"
-        "• `@bot <タスク>` → 新しいセッション＋タスクを実行（bind必須）\n"
+        "• `@bot in <path> <タスク>` → 指定ディレクトリでタスクを実行\n"
+        "• `@bot fork <PID> [<タスク>]` → 実行中のclaude CLIプロセスをフォーク\n"
+        "• `@bot fork` → フォーク可能なプロセス一覧\n"
+        "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
         "• (スレッド返信) `<指示>` → 同セッションで自動続行（メンション不要）\n"
-        "• `@bot in <path> <タスク>` → 指定ディレクトリでセッション作成＋実行\n"
         "*管理:*\n"
-        "• `@bot status` → プロジェクト内タスクの状態一覧\n"
-        "• `@bot sessions` → プロジェクト内セッション一覧\n"
+        "• `@bot status` → タスクの状態一覧\n"
+        "• `@bot sessions` → セッション一覧\n"
         "• `@bot cancel #2` → タスクをキャンセル\n"
-        "• `@bot cancel all` → プロジェクト内全タスクをキャンセル\n"
+        "• `@bot cancel all` → 全タスクをキャンセル\n"
         "*設定:*\n"
-        "• `@bot bind` → usage表示＋バインド可能なプロセスリスト\n"
-        "• `@bot bind -d <path>` → チャンネルにプロジェクトルートを紐付け\n"
-        "• `@bot bind -p <PID>` → 実行中のclaude CLIプロセスをフォーク\n"
-        "• `@bot unbind` → プロジェクトルートの紐付けを解除\n"
         "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定"
     )
 
@@ -2897,7 +2878,7 @@ def _handle_status(say, thread_ts, channel_id: str):
     """プロジェクトスコープのタスク状態一覧"""
     project = runner.get_project(channel_id)
     if not project:
-        say(text=":warning: このチャンネルにはプロジェクトが設定されていません", thread_ts=thread_ts)
+        say(text=":zzz: このチャンネルにはまだタスクがありません", thread_ts=thread_ts)
         return
 
     active_sessions = project.active_sessions
@@ -2918,7 +2899,7 @@ def _handle_status(say, thread_ts, channel_id: str):
             say(text=":zzz: 実行中のタスクはありません", thread_ts=thread_ts)
         return
 
-    lines = [f":gear: *実行中のタスク ({len(active_sessions)}セッション)*  :file_folder: `{os.path.basename(project.root_dir)}`"]
+    lines = [f":gear: *実行中のタスク ({len(active_sessions)}セッション)*"]
     for session in active_sessions:
         task = session.active_task
         if not task:
@@ -2969,185 +2950,14 @@ def _handle_cancel(text: str, say, thread_ts, channel_id: str):
         say(text=f"タスク #{task_id} は実行中ではありません", thread_ts=thread_ts)
 
 
-def _handle_bind(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
-    """bind 統合ハンドラ: -d <path> / -p <PID> / 引数なし(usage+プロセスリスト)"""
-    rest = text[4:].strip()  # "bind" の後ろ
-
-    usage = (
-        "*使い方:*\n"
-        "• `bind -d <path>` — チャンネルにプロジェクトルートを紐付け\n"
-        "• `bind -p <PID>` — 実行中のclaude CLIプロセスをフォーク\n"
-        "• `bind` — この表示＋バインド可能なプロセスリスト\n"
-        "• `unbind` — 紐付けを解除"
-    )
-
-    # ── bind -d <path> ──
-    if rest.startswith("-d ") or rest.startswith("-d\t"):
-        dir_path = rest[3:].strip()
-        if not dir_path:
-            say(text=":warning: パスを指定してください: `bind -d <path>`", thread_ts=thread_ts)
-            return
-        expanded = os.path.abspath(os.path.expanduser(dir_path))
-        if not os.path.isdir(expanded):
-            say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
-            return
-        runner.bind_project(channel_id, expanded)
-        say(
-            text=f":link: このチャンネルのプロジェクトルートを設定しました: `{expanded}`",
-            thread_ts=thread_ts,
-        )
-        return
-
-    # ── bind -p [PID] ──
-    if rest == "-p" or rest.startswith("-p ") or rest.startswith("-p\t"):
-        pid_str = rest[2:].strip()
-        _handle_bind_process(pid_str, say, thread_ts, channel_id, user_id)
-        return
-
-    # ── bind（引数なし）→ usage + プロセスリスト（番号選択可） ──
-    if not rest:
-        _handle_bind_list(usage, say, thread_ts, channel_id, user_id)
-        return
-
-    # ── それ以外 → エラー + usage ──
-    say(
-        text=f":warning: 不明な引数: `{rest}`\n\n{usage}",
-        thread_ts=thread_ts,
-    )
-
-
-def _handle_bind_process(pid_str: str, say, thread_ts, channel_id: str, user_id: str):
-    """bind -p のPID指定 / PID省略時のプロセスリスト表示"""
-    target_pid = None
-    if pid_str:
-        try:
-            target_pid = int(pid_str)
-        except ValueError:
-            say(text=":warning: PIDは数字で指定してください: `bind -p <PID>`", thread_ts=thread_ts)
-            return
-
-    # 実行中のclaude CLIプロセスを検出
-    instances = detect_running_claude_instances()
-    if not instances:
-        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
-        return
-
-    # 既に instance_threads で追跡中のPIDを除外
-    tracked_pids = {data["pid"] for data in instance_threads.values()}
-    candidates = [i for i in instances if i["pid"] not in tracked_pids]
-
-    if not candidates:
-        say(
-            text=f":mag: フォーク可能なインスタンスがありません（{len(tracked_pids)}件追跡中）",
-            thread_ts=thread_ts,
-        )
-        return
-
-    # PID指定あり → 直接実行
-    if target_pid is not None:
-        matched = [i for i in candidates if i["pid"] == target_pid]
-        if not matched:
-            if target_pid in tracked_pids:
-                say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
-            else:
-                say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
-            return
-        _execute_bind_fork(matched[0], channel_id, say, thread_ts, user_id)
-        return
-
-    # 1件 → 自動選択
-    if len(candidates) == 1:
-        _execute_bind_fork(candidates[0], channel_id, say, thread_ts, user_id)
-        return
-
-    # 複数件 → 番号リスト投稿 + pending_fork_selections に状態保存
-    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
-    for i, inst in enumerate(candidates, 1):
-        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
-    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
-    say(text="\n".join(lines), thread_ts=thread_ts)
-
-    pending_fork_selections[channel_id] = {
-        "instances": candidates,
-        "thread_ts": thread_ts,
-        "user_id": user_id,
-    }
-
-
-def _handle_bind_list(usage: str, say, thread_ts, channel_id: str, user_id: str):
-    """bind 引数なし: usage表示＋バインド可能なプロセスリスト"""
-    # プロセスリストを取得
-    instances = detect_running_claude_instances()
-    tracked_pids = {data["pid"] for data in instance_threads.values()}
-    candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
-
-    lines = [usage, ""]
-    if candidates:
-        lines.append(":computer: *フォーク可能なclaude CLIインスタンス:*")
-        for i, inst in enumerate(candidates, 1):
-            lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
-        lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
-
-        pending_fork_selections[channel_id] = {
-            "instances": candidates,
-            "thread_ts": thread_ts,
-            "user_id": user_id,
-        }
-    else:
-        lines.append(":mag: フォーク可能なclaude CLIインスタンスはありません")
-
-    say(text="\n".join(lines), thread_ts=thread_ts)
-
-
-def _handle_unbind(say, thread_ts, channel_id: str):
-    """チャンネルのプロジェクトルート紐付けを解除"""
-    removed = runner.unbind_project(channel_id)
-    if removed:
-        say(
-            text=f":broken_chain: プロジェクトルートの紐付けを解除しました（旧: `{removed}`）",
-            thread_ts=thread_ts,
-        )
-    else:
-        say(text=":warning: このチャンネルにはプロジェクトルートが設定されていません", thread_ts=thread_ts)
-
-
-def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = "",
-                   files: list[dict] | None = None):
-    rest = text[3:].strip()
-    parts = rest.split(maxsplit=1)
-    if len(parts) < 2:
-        say(text=":warning: 使い方: `in <path> タスク内容`\n相対パスはプロジェクトルート基準で解決されます", thread_ts=thread_ts)
-        return
-
-    dir_path, prompt = parts
-    dir_path = os.path.expanduser(dir_path)
-
-    # プロジェクトルートが必要（相対パス解決に使用）
-    project = runner.get_project(channel_id)
-    if not project:
-        say(
-            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind -d <path>` でプロジェクトルートを設定してください。",
-            thread_ts=thread_ts,
-        )
-        return
-
-    root = project.root_dir
-
-    # 相対パスをプロジェクトルート基準で解決
-    if not os.path.isabs(dir_path):
-        dir_path = os.path.normpath(os.path.join(root, dir_path))
-        # セキュリティ: 解決後パスがプロジェクトルート配下であることを検証
-        if not dir_path.startswith(root):
-            say(text=f":warning: プロジェクトルート外のパスは指定できません: `{dir_path}`", thread_ts=thread_ts)
-            return
-
-    if not os.path.isdir(dir_path):
-        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
-        return
-
-    # 新セッション作成（working_dir オーバーライド付き）
+def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
+                       channel_id: str, user_id: str = "",
+                       files: list[dict] | None = None):
+    """指定ディレクトリでProject取得→Session作成→Task実行の共通ヘルパー"""
+    project = runner.get_or_create_project(channel_id)
     session = project.get_or_create_session(thread_ts)
     session.working_dir = dir_path
+    runner.record_directory(channel_id, dir_path)
 
     # 添付画像のダウンロードとプロンプト拡張
     if files:
@@ -3166,18 +2976,70 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
         say(text=err, thread_ts=thread_ts)
 
 
+def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = "",
+                   files: list[dict] | None = None):
+    """in <path> <task> — 指定ディレクトリで即座に実行"""
+    rest = text[3:].strip()
+    parts = rest.split(maxsplit=1)
+    if len(parts) < 2:
+        say(text=":warning: 使い方: `in <path> タスク内容`\n絶対パスで指定してください（`~` 展開あり）", thread_ts=thread_ts)
+        return
+
+    dir_path, prompt = parts
+    dir_path = os.path.expanduser(dir_path)
+
+    if not os.path.isabs(dir_path):
+        say(text=f":warning: 絶対パスで指定してください: `{dir_path}`", thread_ts=thread_ts)
+        return
+
+    if not os.path.isdir(dir_path):
+        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+        return
+
+    _start_task_in_dir(dir_path, prompt, say, thread_ts, channel_id, user_id, files)
+
+
+def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
+                 files: list[dict] | None = None):
+    """fork <PID> [<task>] — 実行中のclaude CLIプロセスをフォーク"""
+    parts = rest.split(maxsplit=1)
+    pid_str = parts[0]
+    initial_input = parts[1] if len(parts) > 1 else None
+
+    try:
+        target_pid = int(pid_str)
+    except ValueError:
+        say(text=":warning: PIDは数字で指定してください: `fork <PID> [<task>]`", thread_ts=thread_ts)
+        return
+
+    # 実行中のclaude CLIプロセスを検出
+    instances = detect_running_claude_instances()
+    if not instances:
+        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
+        return
+
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids]
+
+    matched = [i for i in candidates if i["pid"] == target_pid]
+    if not matched:
+        if target_pid in tracked_pids:
+            say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
+        else:
+            say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
+        return
+
+    _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input)
+
+
 def _handle_sessions(say, thread_ts, channel_id: str):
     """プロジェクトスコープのセッション一覧を表示"""
     project = runner.get_project(channel_id)
-    if not project:
-        say(text=":warning: このチャンネルにはプロジェクトが設定されていません", thread_ts=thread_ts)
-        return
-
-    if not project.sessions:
+    if not project or not project.sessions:
         say(text="セッション履歴はまだありません", thread_ts=thread_ts)
         return
 
-    lines = [f":clipboard: *セッション一覧*  :file_folder: `{os.path.basename(project.root_dir)}`"]
+    lines = [":clipboard: *セッション一覧*"]
 
     # 最新のセッション10件を表示
     sessions = sorted(
@@ -3201,8 +3063,8 @@ def _handle_sessions(say, thread_ts, channel_id: str):
 
         sid = session.claude_session_id[:16] + "..." if session.claude_session_id else "N/A"
         task_count = len(session.tasks)
-        cwd = session.working_dir or project.root_dir
-        dir_name = os.path.basename(cwd)
+        cwd = session.working_dir or ""
+        dir_name = os.path.basename(cwd) if cwd else "N/A"
         latest = session.latest_task
         prompt_preview = latest.prompt[:40] + ("..." if latest and len(latest.prompt) > 40 else "") if latest else ""
 
@@ -3215,19 +3077,43 @@ def _handle_sessions(say, thread_ts, channel_id: str):
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
-def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str):
+def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
+    """fork（引数なし）: フォーク可能なプロセスリスト表示"""
+    instances = detect_running_claude_instances()
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
+
+    if not candidates:
+        say(text=":mag: フォーク可能なclaude CLIインスタンスはありません", thread_ts=thread_ts)
+        return
+
+    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
+    for i, inst in enumerate(candidates, 1):
+        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
+    say(text="\n".join(lines), thread_ts=thread_ts)
+
+    pending_fork_selections[channel_id] = {
+        "instances": candidates,
+        "thread_ts": thread_ts,
+        "user_id": user_id,
+    }
+
+
+def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
+                  initial_input: str | None = None):
     """フォーク実行: Project+Session作成、instance_threads登録、監視開始"""
     pid = inst["pid"]
     cwd = inst["cwd"]
 
-    # 1. Project 作成/更新
-    project = runner.bind_project(channel_id, cwd)
+    # 1. Project 取得/作成
+    project = runner.get_or_create_project(channel_id)
 
     # 2. Slack にフォーク開始メッセージ投稿 → fork_thread_ts 取得
     try:
         resp = say(
             text=(
-                f":fork_and_knife: *bind -p* — PID {pid} をこのチャンネルにフォーク\n"
+                f":fork_and_knife: *fork* — PID {pid} をフォーク\n"
                 f":file_folder: `{cwd}`\n"
                 f":clock1: 経過: {inst.get('etime', '?')}\n"
                 f"_このスレッドに返信するとclaude CLIに入力を送信します_"
@@ -3240,14 +3126,14 @@ def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str
         say(text=f":x: フォーク開始メッセージの投稿に失敗しました: {e}", thread_ts=thread_ts)
         return
 
-    # 3. Session 作成
+    # 3. Session 作成 + working_dir 設定
     session = project.get_or_create_session(fork_thread_ts)
+    session.working_dir = cwd
+    runner.record_directory(channel_id, cwd)
 
     # 4. JSONL があれば session_id を抽出
     jsonl_path = _find_session_jsonl(cwd)
     if jsonl_path:
-        # task は無いので、session_id 抽出のみを行う簡易パス
-        # _extract_session_info_from_jsonl は task が必須なのでダミー Task を使う
         dummy_task = Task(id=0, prompt="(fork)")
         _extract_session_info_from_jsonl(dummy_task, session, jsonl_path)
 
@@ -3257,7 +3143,6 @@ def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str
         "tty": inst.get("tty", ""),
         "cwd": cwd,
         "session": session,
-        # task なし = フォークインスタンス
     }
 
     if jsonl_path:
@@ -3282,13 +3167,19 @@ def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str
     )
     monitor.start()
 
-    # 7. 完了通知
+    # 7. initial_input がある場合、PTYまたはクリップボード経由で送信
+    if initial_input:
+        # フォーク後に少し待ってから入力（プロセスの準備完了を待つ）
+        time.sleep(0.5)
+        _handle_instance_input(initial_input, say, fork_thread_ts, channel_id)
+
+    # 8. 完了通知
     monitor_label = "JSONL" if jsonl_path else "Terminal"
     sid_info = f"\n_Session: `{session.claude_session_id[:12]}...`_" if session.claude_session_id else ""
     say(
         text=(
             f":white_check_mark: PID {pid} をフォークしました\n"
-            f":link: プロジェクトルート: `{cwd}`\n"
+            f":file_folder: `{cwd}`\n"
             f":mag: 監視: {monitor_label}{sid_info}"
         ),
         thread_ts=thread_ts,
@@ -3331,7 +3222,124 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
         say(text=f":warning: PID {selected['pid']} は既に終了しています", thread_ts=thread_ts)
         return True
 
-    _execute_bind_fork(selected, channel_id, say, thread_ts, user_id)
+    _execute_fork(selected, channel_id, say, thread_ts, user_id)
+    return True
+
+
+def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str):
+    """ベアタスク: フォーク候補 + ディレクトリ履歴を表示し選択を待つ"""
+    thread_ts = event.get("ts")
+    files = _resolve_event_files(event, channel_id)
+
+    # フォーク候補を収集
+    instances = detect_running_claude_instances()
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    fork_candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
+
+    # ディレクトリ履歴を収集
+    dir_history = runner.directory_history.get(channel_id, [])
+
+    # 選択肢がない場合
+    if not fork_candidates and not dir_history:
+        say(
+            text=(
+                ":warning: 作業ディレクトリを指定してください\n"
+                "• `in <path> <タスク>` — 指定ディレクトリで実行\n"
+                "• `fork <PID>` — 実行中のプロセスをフォーク"
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
+    # 選択肢リストを構築
+    options = []  # (type, data) のリスト
+    lines = [":file_folder: *作業ディレクトリを選択してください:*"]
+
+    idx = 1
+    if fork_candidates:
+        lines.append("\n:computer: *フォーク可能なプロセス:*")
+        for inst in fork_candidates:
+            lines.append(f"  `{idx}` — :fork_and_knife: PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+            options.append(("fork", inst))
+            idx += 1
+
+    if dir_history:
+        lines.append("\n:clock1: *最近のディレクトリ:*")
+        for d in dir_history:
+            lines.append(f"  `{idx}` — :file_folder: `{d}`")
+            options.append(("dir", d))
+            idx += 1
+
+    lines.append("\n番号で選択、絶対パスを入力、または `cancel` でキャンセル")
+    say(text="\n".join(lines), thread_ts=thread_ts)
+
+    pending_directory_requests[thread_ts] = {
+        "prompt": text,
+        "user_id": user_id,
+        "channel_id": channel_id,
+        "options": options,
+        "files": files,
+    }
+
+
+def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
+    """ベアタスクのディレクトリ選択処理。
+    処理した場合 True、fallthrough の場合 False を返す。"""
+    if thread_ts not in pending_directory_requests:
+        return False
+
+    req = pending_directory_requests[thread_ts]
+    prompt = req["prompt"]
+    user_id = req["user_id"]
+    channel_id = req["channel_id"]
+    options = req["options"]
+    files = req.get("files")
+    input_text = text.strip()
+
+    # cancel
+    if input_text.lower() == "cancel":
+        del pending_directory_requests[thread_ts]
+        say(text=":x: キャンセルしました", thread_ts=thread_ts)
+        return True
+
+    # 番号入力
+    num_match = re.match(r"^\s*(\d+)\s*$", input_text)
+    if num_match:
+        num = int(num_match.group(1))
+        if num < 1 or num > len(options):
+            say(text=f":warning: 1〜{len(options)} の番号を入力してください", thread_ts=thread_ts)
+            return True
+
+        opt_type, opt_data = options[num - 1]
+        del pending_directory_requests[thread_ts]
+
+        if opt_type == "fork":
+            # フォーク候補選択
+            if not _is_process_alive(opt_data["pid"]):
+                say(text=f":warning: PID {opt_data['pid']} は既に終了しています", thread_ts=thread_ts)
+                return True
+            _execute_fork(opt_data, channel_id, say, thread_ts, user_id, prompt)
+            return True
+        else:
+            # ディレクトリ選択
+            if not os.path.isdir(opt_data):
+                say(text=f":warning: ディレクトリが見つかりません: `{opt_data}`", thread_ts=thread_ts)
+                return True
+            _start_task_in_dir(opt_data, prompt, say, thread_ts, channel_id, user_id, files)
+            return True
+
+    # 絶対パス入力
+    expanded = os.path.expanduser(input_text)
+    if os.path.isabs(expanded):
+        del pending_directory_requests[thread_ts]
+        if not os.path.isdir(expanded):
+            say(text=f":warning: ディレクトリが見つかりません: `{expanded}`", thread_ts=thread_ts)
+            return True
+        _start_task_in_dir(expanded, prompt, say, thread_ts, channel_id, user_id, files)
+        return True
+
+    # 数字でもcancelでも絶対パスでもない → fallthroughしない（選択中なので）
+    say(text=":warning: 番号、絶対パス、または `cancel` を入力してください", thread_ts=thread_ts)
     return True
 
 
@@ -3341,7 +3349,6 @@ def main():
     logger.info("  Claude Code ⇔ Slack Bridge")
     logger.info("=" * 55)
     logger.info("  Admin:       %s", ADMIN_SLACK_USER_ID)
-    logger.info("  Work Dir:    %s", WORKING_DIR)
     logger.info("  Tools:       %s", DEFAULT_ALLOWED_TOOLS)
     logger.info("  Allowed Users:    %s", SLACK_ALLOWED_USERS or "(none)")
     logger.info("  Allowed Channels: %s", SLACK_ALLOWED_CHANNELS or "(none)")
@@ -3349,10 +3356,8 @@ def main():
     logger.info("=" * 55)
     logger.info("Ctrl+C で終了")
 
-    # プロジェクト設定を読み込み
-    runner.load_projects()
-    if runner.projects:
-        logger.info("チャンネルプロジェクト紐付け: %d件", len(runner.projects))
+    # ディレクトリ履歴を読み込み
+    runner.load_directory_history()
 
     # 起動通知
     if NOTIFICATION_CHANNEL:
@@ -3361,8 +3366,7 @@ def main():
                 channel=NOTIFICATION_CHANNEL,
                 text=(
                     ":rocket: *Claude Code Bridge が起動しました*\n"
-                    f":file_folder: デフォルト作業ディレクトリ: `{WORKING_DIR}`\n"
-                    "チャンネルで `@bot <タスク>` を送信してください"
+                    "チャンネルで `@bot in <path> <タスク>` を送信してください"
                 ),
             )
         except Exception as e:

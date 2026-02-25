@@ -62,6 +62,6 @@ def make_session():
 @pytest.fixture
 def make_project():
     """Project ファクトリ"""
-    def _factory(channel_id="C123", root_dir="/tmp/test", **kwargs):
+    def _factory(channel_id="C123", root_dir=None, **kwargs):
         return bridge.Project(channel_id=channel_id, root_dir=root_dir, **kwargs)
     return _factory
