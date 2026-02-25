@@ -1046,8 +1046,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if text == last_posted_text:
             return  # 同一テキストの重複投稿を防止
         last_posted_text = text
-        # PTYペンディングメッセージを確定（JSONL経由で正式な応答が来たため）
-        _finalize_pty_pending(inst, channel, client)
+        # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除
+        _finalize_pty_pending(inst, channel, client, delete=True)
         display = _md_to_slack(text)
         if len(display) > MAX_SLACK_MSG_LENGTH:
             display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
@@ -1056,8 +1056,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
-        # PTYペンディングメッセージを確定（JSONL経由で正式な質問が来たため）
-        _finalize_pty_pending(inst, channel, client)
+        # JSONL経由で正式な質問が来たため、PTYペンディングメッセージを削除
+        _finalize_pty_pending(inst, channel, client, delete=True)
         try:
             client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
@@ -1489,17 +1489,22 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
         logger.error("PTY pending投稿エラー PID %d: %s", pid, e)
 
 
-def _finalize_pty_pending(inst: dict, channel_id: str, client: WebClient):
-    """PTYのペンディングメッセージを確定（⏳インジケータ除去）。
-    JSONL経由で正式な応答が投稿された場合や、プロセス終了時に呼ばれる。"""
+def _finalize_pty_pending(inst: dict, channel_id: str, client: WebClient,
+                          *, delete: bool = False):
+    """PTYのペンディングメッセージを確定。
+    delete=True: JSONL経由で正式な応答が投稿されるため、PTYメッセージを削除。
+    delete=False: プロセス終了時等、⏳インジケータを除去してメッセージを残す。"""
     pending_ts = inst.pop("pty_pending_msg_ts", None)
     pending_text = inst.pop("pty_pending_text", None)
-    if not pending_ts or not pending_text:
+    if not pending_ts:
         return
     try:
-        client.chat_update(
-            channel=channel_id, ts=pending_ts, text=pending_text,
-        )
+        if delete:
+            client.chat_delete(channel=channel_id, ts=pending_ts)
+        elif pending_text:
+            client.chat_update(
+                channel=channel_id, ts=pending_ts, text=pending_text,
+            )
     except Exception:
         pass
 
