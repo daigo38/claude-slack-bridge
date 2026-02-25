@@ -1041,7 +1041,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _flush_status(final=True)
 
     def _post_text(text: str):
-        """応答テキストを新しいメッセージとして投稿。同一テキストの重複投稿を防止。"""
+        """応答テキストをステータスメッセージに追記。同一テキストの重複投稿を防止。"""
         nonlocal last_posted_text
         if text == last_posted_text:
             return  # 同一テキストの重複投稿を防止
@@ -1051,13 +1051,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         display = _md_to_slack(text)
         if len(display) > MAX_SLACK_MSG_LENGTH:
             display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-        try:
-            client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f":speech_balloon: {display_prefix}\n{display}",
-            )
-        except Exception as e:
-            logger.error("JSONL応答投稿エラー %s: %s", display_prefix, e)
+        status_lines.append(f":speech_balloon: {display_prefix}\n{display}")
+        _flush_status(final=True)
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
@@ -1130,7 +1125,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 if category == "status":
                     # テキストが溜まっていたら先にフラッシュ
                     if text_parts:
-                        _finalize_status()
                         _post_text("\n".join(text_parts))
                         text_parts = []
                     status_lines.append(text)
@@ -1138,23 +1132,19 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 elif category == "text":
                     text_parts.append(text)
                 elif category == "question":
-                    # 先にステータスとテキストを確定
+                    # 先にテキストを確定
                     if text_parts:
-                        _finalize_status()
                         _post_text("\n".join(text_parts))
                         text_parts = []
                     _finalize_status()
                     has_status = False
-                    # 選択肢をスレッドに投稿
+                    # 選択肢をスレッドに投稿（質問は別メッセージ）
                     _post_question(text, metadata)
 
-        # テキスト応答があれば投稿
+        # テキスト応答があれば追記
         if text_parts:
-            _finalize_status()
             _post_text("\n".join(text_parts))
-
-        # ステータス更新
-        if has_status and not text_parts:
+        elif has_status:
             _flush_status()
 
     # プロセス終了 → 残りのエントリを処理
@@ -1166,7 +1156,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
                     if text_parts:
-                        _finalize_status()
                         _post_text("\n".join(text_parts))
                         text_parts = []
                     status_lines.append(text)
@@ -1174,13 +1163,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     text_parts.append(text)
                 elif category == "question":
                     if text_parts:
-                        _finalize_status()
                         _post_text("\n".join(text_parts))
                         text_parts = []
                     _finalize_status()
                     _post_question(text, metadata)
         if text_parts:
-            _finalize_status()
             _post_text("\n".join(text_parts))
 
     # 残ったステータスを確定
