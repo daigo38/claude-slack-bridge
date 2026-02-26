@@ -969,6 +969,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     status_msg_ts: Optional[str] = None  # ステータスメッセージ（thinking/tool_use）
     status_lines: list[str] = []          # ステータス行の蓄積
     last_posted_text: Optional[str] = None  # 重複投稿防止用
+    latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
+    pty_pending_cleaned: bool = False  # PTY pending cleanup 追跡
 
     def _extract_task_info(entry: dict):
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
@@ -1014,12 +1016,28 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     if text:
                         task_ref.result = text
 
-    def _flush_status(final: bool = False):
-        """ステータスメッセージを更新。final=Trueで⏳を除去。"""
+    def _flush_progress(final: bool = False):
+        """進捗メッセージを更新（テキスト応答 + ステータス行を1メッセージに統合）。
+        final=Trueで⏳を除去。"""
         nonlocal status_msg_ts
-        if not status_lines:
+        if not status_lines and not latest_text:
             return
-        text = "\n".join(status_lines)
+        parts = []
+        if latest_text:
+            display = _md_to_slack(latest_text)
+            # テキスト部分が長すぎる場合は切り詰め
+            max_text = MAX_SLACK_MSG_LENGTH // 2
+            if len(display) > max_text:
+                display = display[:max_text] + "\n...(続き)"
+            parts.append(f":speech_balloon: {display_prefix}\n{display}")
+        if status_lines:
+            status_text = "\n".join(status_lines)
+            # ステータス部分が長すぎる場合は切り詰め
+            max_status = MAX_SLACK_MSG_LENGTH // 2
+            if len(status_text) > max_status:
+                status_text = "...\n" + status_text[-max_status:]
+            parts.append(status_text)
+        text = "\n\n".join(parts)
         if len(text) > MAX_SLACK_MSG_LENGTH:
             text = "...\n" + text[-MAX_SLACK_MSG_LENGTH:]
         if not final:
@@ -1035,36 +1053,26 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 )
                 status_msg_ts = resp["ts"]
         except Exception as e:
-            logger.error("JSONL状態更新エラー PID %d: %s", pid, e)
+            logger.error("JSONL進捗更新エラー PID %d: %s", pid, e)
 
-    def _finalize_status():
-        """ステータスメッセージを確定（⏳除去）。メッセージは保持して次回も同じメッセージに追記。"""
-        if status_msg_ts and status_lines:
-            _flush_status(final=True)
+    def _finalize_progress():
+        """進捗メッセージを確定（⏳除去）。メッセージは保持して次回も同じメッセージに追記。"""
+        if status_msg_ts and (status_lines or latest_text):
+            _flush_progress(final=True)
 
-    def _post_text(text: str):
-        """応答テキストを独立したメッセージとして投稿。同一テキストの重複投稿を防止。"""
-        nonlocal last_posted_text, status_msg_ts, status_lines
+    def _update_text(text: str):
+        """応答テキストを進捗メッセージ内に統合表示。同一テキストの重複更新を防止。"""
+        nonlocal last_posted_text, latest_text, pty_pending_cleaned
         if text == last_posted_text:
-            return  # 同一テキストの重複投稿を防止
+            return  # 同一テキストの重複更新を防止
         last_posted_text = text
-        # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除
-        _finalize_pty_pending(inst, channel, client, delete=True)
-        # 思考過程メッセージを確定（⏳除去）
-        _finalize_status()
-        # 応答テキストを独立した新規メッセージとして投稿
-        display = _md_to_slack(text)
-        try:
-            _post_or_upload(
-                client, channel, thread_ts, display,
-                header=f":speech_balloon: {display_prefix}",
-                filename=f"response_pid{pid}.md",
-            )
-        except Exception as e:
-            logger.error("JSONL応答投稿エラー PID %d: %s", pid, e)
-        # ステータスをリセット（後続の思考/ツール使用は新メッセージに）
-        status_msg_ts = None
-        status_lines = []
+        latest_text = text
+        # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除（初回のみ）
+        if not pty_pending_cleaned:
+            _finalize_pty_pending(inst, channel, client, delete=True)
+            pty_pending_cleaned = True
+        # 進捗メッセージを更新（同じメッセージを使い続ける）
+        _flush_progress()
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
@@ -1096,18 +1104,20 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
         # 新しい入力があればステータスをリセット（新しいメッセージ群を開始）
         if "input_msg_ts" in inst:
-            _finalize_status()
+            _finalize_progress()
             inst.pop("input_msg_ts")
             inst.pop("input_msg_text", "")
             status_msg_ts = None
             status_lines = []
+            latest_text = None
+            pty_pending_cleaned = False
 
         # JONLファイルが変わった可能性をチェック（外部インスタンス用）
         if not fixed_jsonl:
             cwd = inst.get("cwd", "")
             new_path = _find_session_jsonl(cwd)
             if new_path and new_path != jsonl_path:
-                _finalize_status()
+                _finalize_progress()
                 jsonl_path = new_path
                 inst["jsonl_path"] = jsonl_path
                 file_offset = 0
@@ -1136,60 +1146,60 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
-                    # テキストが溜まっていたら先にフラッシュ
-                    if text_parts:
-                        _post_text("\n".join(text_parts))
-                        text_parts = []
                     status_lines.append(text)
                     has_status = True
                 elif category == "text":
                     text_parts.append(text)
                 elif category == "question":
-                    # 先にテキストを確定
+                    # 先にテキストを更新
                     if text_parts:
-                        _post_text("\n".join(text_parts))
+                        _update_text("\n".join(text_parts))
                         text_parts = []
-                    _finalize_status()
-                    has_status = False
+                    _finalize_progress()
                     # 選択肢をスレッドに投稿（質問は別メッセージ）
                     _post_question(text, metadata)
                     # ステータスをリセット（回答後の思考は新メッセージに）
                     status_msg_ts = None
                     status_lines = []
+                    latest_text = None
+                    has_status = False
 
-        # テキスト応答があれば独立メッセージとして投稿
+        # 全エントリ処理後にまとめて更新
         if text_parts:
-            _post_text("\n".join(text_parts))
+            _update_text("\n".join(text_parts))
         elif has_status:
-            _flush_status()
+            _flush_progress()
 
     # プロセス終了 → 残りのエントリを処理
     new_entries, file_offset = _read_new_jsonl_entries(jsonl_path, file_offset)
     if new_entries:
         text_parts = []
+        has_status = False
         for entry in new_entries:
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
-                    if text_parts:
-                        _post_text("\n".join(text_parts))
-                        text_parts = []
                     status_lines.append(text)
+                    has_status = True
                 elif category == "text":
                     text_parts.append(text)
                 elif category == "question":
                     if text_parts:
-                        _post_text("\n".join(text_parts))
+                        _update_text("\n".join(text_parts))
                         text_parts = []
-                    _finalize_status()
+                    _finalize_progress()
                     _post_question(text, metadata)
                     status_msg_ts = None
                     status_lines = []
+                    latest_text = None
+                    has_status = False
         if text_parts:
-            _post_text("\n".join(text_parts))
+            _update_text("\n".join(text_parts))
+        elif has_status:
+            _flush_progress()
 
-    # 残ったステータスを確定
-    _finalize_status()
+    # 残った進捗を確定
+    _finalize_progress()
 
     # プロセス終了通知（外部インスタンス用）
     if not skip_exit:
@@ -2193,7 +2203,7 @@ class ClaudeCodeRunner:
                 task.completed_at = datetime.now()
                 elapsed = (task.completed_at - task.started_at).total_seconds()
                 summary, full_result = self._format_result(
-                    task, session, elapsed, show_result=not jsonl_monitored
+                    task, session, elapsed, show_result=True
                 )
                 self._post_to_session(session, summary)
                 if full_result:
