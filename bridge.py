@@ -295,8 +295,7 @@ def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
 
 
 def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
-    """Slackの添付ファイル（画像のみ）をダウンロードしローカルパスのリストを返す"""
-    # mimetypeがない場合filetypeからの推定もサポート
+    """Slackの添付ファイルをダウンロードしローカルパスのリストを返す"""
     _IMAGE_FILETYPES = {"jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tiff"}
 
     def _is_image(f: dict) -> bool:
@@ -306,17 +305,14 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
         ft = f.get("filetype", "").lower()
         return ft in _IMAGE_FILETYPES
 
-    image_files = [f for f in files if _is_image(f)]
-    if not image_files:
-        logger.info("添付ファイルに画像なし: %s",
-                    [(f.get("name"), f.get("mimetype"), f.get("filetype")) for f in files])
+    if not files:
         return []
 
     attach_dir = os.path.join(save_dir, ".slack-attachments")
     os.makedirs(attach_dir, exist_ok=True)
 
     paths: list[str] = []
-    for f in image_files:
+    for f in files:
         size = f.get("size", 0)
         if size > MAX_SLACK_FILE_SIZE:
             logger.warning("添付ファイルが大きすぎるためスキップ: %s (%d bytes)", f.get("name"), size)
@@ -328,7 +324,7 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
             continue
 
         # ファイル名のスペースをアンダースコアに置換（パス解釈の問題を防止）
-        raw_name = f.get("name", "image").replace(" ", "_")
+        raw_name = f.get("name", "file").replace(" ", "_")
         filename = f"{int(time.time())}_{raw_name}"
         dest = os.path.join(attach_dir, filename)
         try:
@@ -339,22 +335,26 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
             with open(dest, "wb") as out:
                 out.write(data)
 
-            # 画像を検証・正規化（形式変換、リサイズ等）
-            normalized = _normalize_image(dest)
-            if normalized:
-                paths.append(normalized)
-                logger.info("添付画像を準備: %s", normalized)
+            # 画像の場合は正規化（形式変換、リサイズ等）
+            if _is_image(f):
+                normalized = _normalize_image(dest)
+                if normalized:
+                    paths.append(normalized)
+                    logger.info("添付画像を準備: %s", normalized)
+                else:
+                    logger.warning("添付画像の正規化に失敗、スキップ: %s", raw_name)
             else:
-                logger.warning("添付画像の正規化に失敗、スキップ: %s", raw_name)
+                paths.append(dest)
+                logger.info("添付ファイルを準備: %s", dest)
         except Exception:
             logger.exception("添付ファイルのダウンロードに失敗: %s", raw_name)
     return paths
 
 
-def _augment_prompt_with_images(prompt: str, image_paths: list[str]) -> str:
-    """画像パスをプロンプト末尾に追記"""
-    lines = "\n".join(image_paths)
-    return f"{prompt}\n\n添付画像:\n{lines}"
+def _augment_prompt_with_files(prompt: str, file_paths: list[str]) -> str:
+    """添付ファイルパスをプロンプト末尾に追記"""
+    lines = "\n".join(file_paths)
+    return f"{prompt}\n\n添付ファイル:\n{lines}"
 
 
 # ---------------------------------------------------------------------------
@@ -2568,11 +2568,11 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
             prompt = _build_question_answer_prompt(question_text, options, None, prompt)
         session.pending_question = None
 
-    # 添付画像のダウンロードとプロンプト拡張
+    # 添付ファイルのダウンロードとプロンプト拡張
     if files and session.working_dir:
-        image_paths = _download_slack_files(files, session.working_dir)
-        if image_paths:
-            prompt = _augment_prompt_with_images(prompt, image_paths)
+        file_paths = _download_slack_files(files, session.working_dir)
+        if file_paths:
+            prompt = _augment_prompt_with_files(prompt, file_paths)
 
     # セッションにclaude_session_idがまだ設定されていない場合、短時間待機
     # （前タスクの_executeがJSONL処理中の可能性があるため）
@@ -2780,12 +2780,12 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
     戻り値: True=処理済み, False=EIOでinstance_threadsから除去済み（呼び出し元でフォールスルーすべき）"""
     inst = instance_threads[parent_ts]
 
-    # 添付画像がある場合、ダウンロードしてテキストに画像パスを追記
+    # 添付ファイルがある場合、ダウンロードしてテキストにパスを追記
     if files:
         cwd = inst.get("cwd", os.getcwd())
-        image_paths = _download_slack_files(files, cwd)
-        if image_paths:
-            text = _augment_prompt_with_images(text, image_paths)
+        file_paths = _download_slack_files(files, cwd)
+        if file_paths:
+            text = _augment_prompt_with_files(text, file_paths)
     tty = inst.get("tty", "")
     pid = inst["pid"]
     master_fd = inst.get("master_fd")
@@ -3113,11 +3113,11 @@ def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
     session.working_dir = dir_path
     runner.record_directory(channel_id, dir_path)
 
-    # 添付画像のダウンロードとプロンプト拡張
+    # 添付ファイルのダウンロードとプロンプト拡張
     if files:
-        image_paths = _download_slack_files(files, dir_path)
-        if image_paths:
-            prompt = _augment_prompt_with_images(prompt, image_paths)
+        file_paths = _download_slack_files(files, dir_path)
+        if file_paths:
+            prompt = _augment_prompt_with_files(prompt, file_paths)
 
     task = Task(
         id=0,

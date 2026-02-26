@@ -1,7 +1,7 @@
 """テキスト処理関数のテスト。
 
 対象: _md_to_slack, _strip_ansi, _filter_terminal_ui,
-      _augment_prompt_with_images, _strip_bot_mention, _summarize_input
+      _augment_prompt_with_files, _strip_bot_mention, _summarize_input
 """
 
 import bridge
@@ -216,22 +216,26 @@ class TestFilterTerminalUI:
         assert result == "text"
 
 
-# ── _augment_prompt_with_images ───────────────────────────
+# ── _augment_prompt_with_files ────────────────────────────
 
-class TestAugmentPromptWithImages:
-    def test_appends_image_paths(self):
-        result = bridge._augment_prompt_with_images("describe", ["/tmp/a.png", "/tmp/b.jpg"])
+class TestAugmentPromptWithFiles:
+    def test_appends_file_paths(self):
+        result = bridge._augment_prompt_with_files("describe", ["/tmp/a.png", "/tmp/b.jpg"])
         assert result.startswith("describe")
         assert "/tmp/a.png" in result
         assert "/tmp/b.jpg" in result
-        assert "\u6dfb\u4ed8\u753b\u50cf:" in result  # 「添付画像:」
+        assert "\u6dfb\u4ed8\u30d5\u30a1\u30a4\u30eb:" in result  # 「添付ファイル:」
 
-    def test_single_image(self):
-        result = bridge._augment_prompt_with_images("hello", ["/img.png"])
+    def test_single_file(self):
+        result = bridge._augment_prompt_with_files("hello", ["/img.png"])
         assert "/img.png" in result
 
+    def test_non_image_file(self):
+        result = bridge._augment_prompt_with_files("read this", ["/tmp/spec.md"])
+        assert "/tmp/spec.md" in result
+
     def test_preserves_original_prompt(self):
-        result = bridge._augment_prompt_with_images("original prompt", ["/x.png"])
+        result = bridge._augment_prompt_with_files("original prompt", ["/x.png"])
         assert result.startswith("original prompt")
 
 
