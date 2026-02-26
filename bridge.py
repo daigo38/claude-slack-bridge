@@ -3079,7 +3079,7 @@ def _handle_root(text: str, say, thread_ts: str, channel_id: str):
 
     project.root_dir = dir_path
     runner.save_channel_roots()
-    say(text=t("root_set", path=dir_path), thread_ts=thread_ts)
+    say(text=t("root_set", path=dir_path))
 
 
 def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
