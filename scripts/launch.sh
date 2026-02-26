@@ -1,0 +1,37 @@
+#!/bin/bash
+# claude-slack-bridge 起動ラッパー
+# LaunchAgentから呼び出される。venv有効化 + .env読み込み + bridge.py実行
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_DIR"
+
+# venv有効化
+if [ -f "venv/bin/activate" ]; then
+    source venv/bin/activate
+else
+    echo "Error: venv/bin/activate not found in $PROJECT_DIR" >&2
+    exit 1
+fi
+
+# .env読み込み（値に括弧等を含む行にも対応）
+if [ -f ".env" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 空行・コメント行をスキップ
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # KEY=VALUE形式の行のみexport
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            export "$key=$value"
+        fi
+    done < .env
+else
+    echo "Error: .env not found in $PROJECT_DIR" >&2
+    exit 1
+fi
+
+exec python bridge.py
