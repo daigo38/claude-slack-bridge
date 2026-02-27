@@ -29,3 +29,5 @@ channel_roots.json
 
 # Slack attachment cache
 .slack-attachments/
+.serena
+articles
