@@ -2668,7 +2668,7 @@ runner = ClaudeCodeRunner(slack_client)
 instance_threads: dict[str, dict] = {}
 
 # 現在監視中のJSONLファイルパス（重複監視防止）
-_monitored_jsonl_paths: set[str] = {}
+_monitored_jsonl_paths: set[str] = set()
 
 # fork の複数候補選択状態（channel_id → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
