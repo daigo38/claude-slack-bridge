@@ -706,9 +706,28 @@ return ""
 def _is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    # ゾンビプロセス検出: os.kill(0) はゾンビでも成功するため、
+    # waitpid(WNOHANG) でゾンビかどうか確認する
+    try:
+        waited_pid, status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid != 0:
+            return False  # ゾンビだった（reap済み）
+    except ChildProcessError:
+        # 自プロセスの子でない場合は waitpid が使えない
+        # /proc が使えないmacOSではpsコマンドで確認
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+            stat = result.stdout.strip()
+            if stat.startswith("Z"):
+                return False
+        except Exception:
+            pass
+    return True
 
 
 # ── セッションJSONL監視 ──────────────────────────────────
