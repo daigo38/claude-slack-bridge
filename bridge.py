@@ -2515,7 +2515,8 @@ class ClaudeCodeRunner:
             proc.wait()
 
             if task.status == TaskStatus.CANCELLED:
-                self._post_to_session(session, f"{display_label}  {t('task_cancelled')}")
+                self._post_completion(session, task,
+                                      f"{display_label}  {t('task_cancelled')}", inst)
                 self._cleanup_status_message(inst, session, task)
                 return
 
@@ -2546,21 +2547,21 @@ class ClaudeCodeRunner:
                 summary, full_result = self._format_result(
                     task, session, elapsed, show_result=True
                 )
-                self._post_to_session(session, summary)
-                if full_result:
-                    self._upload_to_session(session, full_result, filename=f"result_{task.short_id}.md")
+                self._post_completion(session, task, summary, inst,
+                                      full_result=full_result)
             else:
                 stderr_raw = proc.stderr.read() if proc.stderr else ""
                 stderr_output = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else stderr_raw
                 task.status = TaskStatus.FAILED
                 task.error = stderr_output
                 task.completed_at = datetime.now()
-                self._post_to_session(
-                    session,
+                self._post_completion(
+                    session, task,
                     f"{display_label}  {t('task_failed', code=proc.returncode)}\n```{stderr_output[:1000]}```",
+                    inst,
                 )
 
-            # ステータス履歴スニペット投稿 + 進捗メッセージ削除
+            # 進捗メッセージ削除
             self._cleanup_status_message(inst, session, task)
 
         except Exception as e:
@@ -2568,7 +2569,8 @@ class ClaudeCodeRunner:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
-            self._post_to_session(session, f"{display_label}  {t('task_error', error=e)}")
+            self._post_completion(session, task,
+                                  f"{display_label}  {t('task_error', error=e)}", inst)
             self._cleanup_status_message(inst, session, task)
 
         finally:
@@ -2646,37 +2648,45 @@ class ClaudeCodeRunner:
         except Exception as e:
             logger.error("Slack file upload error: %s", e)
 
-    def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
-        """タスク完了時: ステータス履歴をスニペット投稿し、進捗メッセージを削除"""
-        if not inst:
-            logger.debug("_cleanup_status_message: inst is None, skipping thread=%s", session.thread_ts)
-            return
-        all_status_history = inst.get("_status_history", [])
-        status_msg_ts = inst.get("_status_msg_ts")
-        logger.debug("_cleanup_status_message: history_len=%d status_msg_ts=%s thread=%s",
-                     len(all_status_history), status_msg_ts, session.thread_ts)
-
-        # ステータス履歴が十分にあればスニペットとして投稿
-        if len(all_status_history) >= 3:
-            snippet_content = "\n".join(all_status_history)
+    def _post_completion(self, session: Session, task: Task,
+                         text: str, inst: dict | None,
+                         *, full_result: str | None = None):
+        """完了メッセージ + ステータス履歴 + 結果全文をまとめて1メッセージで投稿"""
+        status_history = inst.get("_status_history", []) if inst else []
+        file_uploads: list[dict] = []
+        if full_result:
+            file_uploads.append({
+                "content": full_result,
+                "filename": f"result_{task.short_id}.md",
+                "title": t("task_full_text_title"),
+            })
+        if len(status_history) >= 3:
+            snippet_content = "\n".join(status_history)
+            file_uploads.append({
+                "content": snippet_content,
+                "filename": f"progress_{task.short_id}.txt",
+                "title": t("status_history_title"),
+            })
+        if file_uploads:
             try:
                 self.client.files_upload_v2(
                     channel=session.channel_id,
                     thread_ts=session.thread_ts or None,
-                    content=snippet_content,
-                    filename=f"progress_{task.short_id}.txt",
-                    title=t("status_history_title"),
+                    initial_comment=text,
+                    file_uploads=file_uploads,
                 )
+                return
             except Exception as e:
-                logger.error("Status history upload error: %s", e)
-                # フォールバック: テキストメッセージとして投稿
-                try:
-                    max_len = MAX_SLACK_MSG_LENGTH - 50
-                    preview = snippet_content if len(snippet_content) <= max_len else snippet_content[:max_len] + "\n…"
-                    self._post_to_session(session, f"```\n{preview}\n```")
-                except Exception as e2:
-                    logger.error("Status history fallback post also failed: %s", e2)
+                logger.error("Completion upload error: %s", e)
+                # フォールバック: テキストのみ投稿
+        self._post_to_session(session, text)
 
+    def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
+        """タスク完了時: 進捗メッセージを削除"""
+        if not inst:
+            logger.debug("_cleanup_status_message: inst is None, skipping thread=%s", session.thread_ts)
+            return
+        status_msg_ts = inst.get("_status_msg_ts")
         # 進捗メッセージを削除（ベストエフォート）
         if status_msg_ts:
             try:
@@ -3230,15 +3240,18 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                 if session_ref:
                     session_ref.pending_question = None
                 _finalize_pty_pending(inst, channel_id, slack_client)
-            else:
-                # 通常のテキスト入力
-                if pending_q and pending_q.get("multi_select", False):
-                    inst.pop("pending_question", None)
-                    session_ref = inst.get("session")
-                    if session_ref:
-                        session_ref.pending_question = None
-                    _finalize_pty_pending(inst, channel_id, slack_client)
+            elif pending_q and pending_q.get("multi_select", False):
+                # multi_select質問へのテキスト回答
+                inst.pop("pending_question", None)
+                session_ref = inst.get("session")
+                if session_ref:
+                    session_ref.pending_question = None
+                _finalize_pty_pending(inst, channel_id, slack_client)
                 os.write(master_fd, text.encode("utf-8") + b"\r")
+            else:
+                # 質問待ちでない → タスク実行中なので入力を受け付けない
+                say(text=t("input_blocked_task_running"), thread_ts=parent_ts)
+                return True
 
             # Slack通知
             if action_label:
@@ -3301,15 +3314,13 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             if session_ref:
                 session_ref.pending_question = None
             _finalize_pty_pending(inst, channel_id, slack_client)
-        else:
-            # 通常のテキスト入力（既存動作）
-            # multiSelectの場合もフォールバック
-            if pending_q and pending_q.get("multi_select", False):
-                inst.pop("pending_question", None)
-                session_ref = inst.get("session")
-                if session_ref:
-                    session_ref.pending_question = None
-                _finalize_pty_pending(inst, channel_id, slack_client)
+        elif pending_q and pending_q.get("multi_select", False):
+            # multi_select質問へのテキスト回答
+            inst.pop("pending_question", None)
+            session_ref = inst.get("session")
+            if session_ref:
+                session_ref.pending_question = None
+            _finalize_pty_pending(inst, channel_id, slack_client)
 
             subprocess.run(
                 ["pbcopy"],
@@ -3318,6 +3329,10 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             )
             script = _build_paste_script(tty_device)
             action_label = None
+        else:
+            # 質問待ちでない → タスク実行中なので入力を受け付けない
+            say(text=t("input_blocked_task_running"), thread_ts=parent_ts)
+            return True
 
         result = subprocess.run(
             ["osascript", "-e", script],

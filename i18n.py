@@ -123,6 +123,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "input_sent_waiting": ":arrow_right: PID {pid} に入力を送信しました :hourglass_flowing_sand:",
         "input_answer_sent": ":arrow_right: PID {pid} に回答を送信: {label} :white_check_mark:",
         "input_selected_option": "選択肢 {num} ({label}) を選択",
+        "input_blocked_task_running": ":hourglass_flowing_sand: タスク実行中のため、新しい指示は受け付けられません。完了後にもう一度返信してください。",
 
         # ── notify (起動/停止通知) ──
         "notify_startup": (
@@ -292,6 +293,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "input_sent_waiting": ":arrow_right: Input sent to PID {pid} :hourglass_flowing_sand:",
         "input_answer_sent": ":arrow_right: Answer sent to PID {pid}: {label} :white_check_mark:",
         "input_selected_option": "Option {num} ({label}) selected",
+        "input_blocked_task_running": ":hourglass_flowing_sand: A task is currently running. Please reply again after it completes.",
 
         # ── notify ──
         "notify_startup": (
