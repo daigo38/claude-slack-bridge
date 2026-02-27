@@ -258,23 +258,25 @@ class TestFormatExitPlanMode:
     def test_with_plan(self):
         text, meta = bridge._format_exit_plan_mode({"plan": "Build a feature"})
         assert "プランの承認" in text
-        assert "Build a feature" in text
+        # プラン内容はmetadata["plan_content"]に格納（テキストにはインライン表示しない）
+        assert meta["plan_content"] == "Build a feature"
         assert meta is not None
         assert len(meta["questions"]) == 1
         assert len(meta["questions"][0]["options"]) == 2
 
     def test_content_field(self):
-        text, _ = bridge._format_exit_plan_mode({"content": "My plan"})
-        assert "My plan" in text
+        _, meta = bridge._format_exit_plan_mode({"content": "My plan"})
+        assert meta["plan_content"] == "My plan"
 
     def test_summary_field(self):
-        text, _ = bridge._format_exit_plan_mode({"summary": "Plan summary"})
-        assert "Plan summary" in text
+        _, meta = bridge._format_exit_plan_mode({"summary": "Plan summary"})
+        assert meta["plan_content"] == "Plan summary"
 
     def test_without_plan(self):
         text, meta = bridge._format_exit_plan_mode({})
         assert "プランの承認" in text
         assert meta is not None
+        assert meta["plan_content"] == ""
 
     def test_allowed_prompts(self):
         tool_input = {
@@ -283,15 +285,16 @@ class TestFormatExitPlanMode:
                 {"tool": "Bash", "prompt": "Run tests"},
             ],
         }
-        text, _ = bridge._format_exit_plan_mode(tool_input)
-        assert "Bash" in text
-        assert "Run tests" in text
-        assert "許可プロンプト" in text
+        _, meta = bridge._format_exit_plan_mode(tool_input)
+        assert "Bash" in meta["plan_content"]
+        assert "Run tests" in meta["plan_content"]
+        assert "許可プロンプト" in meta["plan_content"]
 
-    def test_long_plan_truncated(self):
+    def test_long_plan_not_truncated(self):
+        """プラン内容はファイルアップロードされるため、切り詰めない"""
         long_plan = "x" * 3000
-        text, _ = bridge._format_exit_plan_mode({"plan": long_plan})
-        assert "省略" in text
+        _, meta = bridge._format_exit_plan_mode({"plan": long_plan})
+        assert meta["plan_content"] == long_plan
 
     def test_options_in_metadata(self):
         _, meta = bridge._format_exit_plan_mode({"plan": "test"})

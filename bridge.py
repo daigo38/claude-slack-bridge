@@ -907,7 +907,7 @@ def _format_ask_user_question(tool_input: dict) -> tuple[str, dict | None]:
 
 def _format_exit_plan_mode(tool_input: dict) -> tuple[str, dict | None]:
     """ExitPlanModeをプラン承認質問として整形。
-    tool_inputからプラン内容を抽出して表示する。"""
+    プラン内容は metadata["plan_content"] に格納（質問メッセージにはインライン表示しない）。"""
     plan_text = ""
     if isinstance(tool_input, dict):
         # 既知のフィールドを順に探す
@@ -927,13 +927,6 @@ def _format_exit_plan_mode(tool_input: dict) -> tuple[str, dict | None]:
                 plan_text += "\n\n" + t("question_allowed_prompts") + "\n" + "\n".join(prompt_lines)
 
     lines = [t("question_plan_approval_required")]
-    if plan_text:
-        # Slack表示用にプラン内容をコードブロックで表示（長い場合は切り詰め）
-        display = plan_text
-        max_plan_len = 2500  # 質問テキスト等のオーバーヘッドを考慮
-        if len(display) > max_plan_len:
-            display = display[:max_plan_len] + "\n" + t("question_plan_truncated")
-        lines.append(f"```\n{display}\n```")
     lines.append(f"  1. {t('question_approve_execute')}")
     lines.append(f"  2. {t('question_reject_feedback')}")
     lines.append(t("question_reply_with_feedback"))
@@ -945,7 +938,8 @@ def _format_exit_plan_mode(tool_input: dict) -> tuple[str, dict | None]:
                 {"label": t("question_reject_feedback"), "description": ""},
             ],
             "multi_select": False,
-        }]
+        }],
+        "plan_content": plan_text,
     }
     return ("\n".join(lines), metadata)
 
@@ -1038,6 +1032,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     session_id_for_subagents = os.path.splitext(os.path.basename(jsonl_path))[0] if jsonl_path else ""
     subagents_dir = os.path.join(jsonl_dir, session_id_for_subagents, "subagents") if jsonl_path else ""
     subagent_offsets: dict[str, int] = {}
+
+    # プラン承認バッファリング（概要テキストを先に表示するため）
+    pending_plan_approval: list | None = None  # [question_text, metadata, wait_count]
 
     def _extract_task_info(entry: dict):
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
@@ -1167,6 +1164,20 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             if session_ref:
                 session_ref.pending_question = pq
 
+    def _post_plan_approval(question_text: str, metadata: dict | None):
+        """プラン承認質問を投稿。plan_contentがあればファイルとしてアップロード。"""
+        plan_content = metadata.get("plan_content", "") if metadata else ""
+        if plan_content:
+            try:
+                client.files_upload_v2(
+                    channel=channel, thread_ts=thread_ts,
+                    content=plan_content, filename="plan.md",
+                    title=t("question_plan_approval_required"),
+                )
+            except Exception as e:
+                logger.error("Plan file upload error PID %d: %s", pid, e)
+        _post_question(question_text, metadata)
+
     while _is_process_alive(pid):
         time.sleep(TERMINAL_POLL_INTERVAL)
 
@@ -1192,6 +1203,18 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
         new_entries, file_offset = _read_new_jsonl_entries(jsonl_path, file_offset)
         if not new_entries:
+            # バッファリング中のプラン承認のタイムアウトチェック
+            if pending_plan_approval:
+                pending_plan_approval[2] += 1
+                timeout_polls = max(1, int(15 / TERMINAL_POLL_INTERVAL))
+                if pending_plan_approval[2] >= timeout_polls:
+                    _finalize_progress()
+                    _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
+                    pending_plan_approval = None
+                    status_msg_ts = None
+                    status_lines = []
+                    latest_text = None
+
             # サブエージェントJSONLのみ活動がある場合もチェック
             if subagents_dir:
                 sub_entries = _read_subagent_jsonl_entries(subagents_dir, subagent_offsets)
@@ -1238,8 +1261,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         _update_text("\n".join(text_parts))
                         text_parts = []
                     _finalize_progress()
-                    # 選択肢をスレッドに投稿（質問は別メッセージ）
-                    _post_question(text, metadata)
+                    # プラン承認はバッファリング（概要テキストを先に表示するため）
+                    if metadata and metadata.get("plan_content") is not None:
+                        pending_plan_approval = [text, metadata, 0]
+                    else:
+                        _post_question(text, metadata)
                     # ステータスをリセット（回答後の思考は新メッセージに）
                     status_msg_ts = None
                     status_lines = []
@@ -1254,6 +1280,29 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     if category == "status":
                         status_lines.append(f"  ↳ {text}")
                         has_status = True
+
+        # バッファリング中のプラン承認: テキストが来たら概要→プラン→承認の順で投稿
+        if pending_plan_approval:
+            if text_parts:
+                _update_text("\n".join(text_parts))
+                text_parts = []
+                _finalize_progress()
+                _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
+                pending_plan_approval = None
+                status_msg_ts = None
+                status_lines = []
+                latest_text = None
+            else:
+                pending_plan_approval[2] += 1
+                # タイムアウト: テキストが来なくても投稿（約15秒）
+                timeout_polls = max(1, int(15 / TERMINAL_POLL_INTERVAL))
+                if pending_plan_approval[2] >= timeout_polls:
+                    _finalize_progress()
+                    _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
+                    pending_plan_approval = None
+                    status_msg_ts = None
+                    status_lines = []
+                    latest_text = None
 
         # 全エントリ処理後にまとめて更新
         if text_parts:
@@ -1279,7 +1328,10 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         _update_text("\n".join(text_parts))
                         text_parts = []
                     _finalize_progress()
-                    _post_question(text, metadata)
+                    if metadata and metadata.get("plan_content") is not None:
+                        pending_plan_approval = [text, metadata, 0]
+                    else:
+                        _post_question(text, metadata)
                     status_msg_ts = None
                     status_lines = []
                     latest_text = None
@@ -1292,10 +1344,27 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     if category == "status":
                         status_lines.append(f"  ↳ {text}")
                         has_status = True
-        if text_parts:
+        # バッファリング中のプラン承認をフラッシュ
+        if pending_plan_approval:
+            if text_parts:
+                _update_text("\n".join(text_parts))
+                text_parts = []
+            _finalize_progress()
+            _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
+            pending_plan_approval = None
+            status_msg_ts = None
+            status_lines = []
+            latest_text = None
+        elif text_parts:
             _update_text("\n".join(text_parts))
         elif has_status:
             _flush_progress()
+
+    # バッファリング中のプラン承認が残っていたらフラッシュ
+    if pending_plan_approval:
+        _finalize_progress()
+        _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
+        pending_plan_approval = None
 
     # 残った進捗を確定
     _finalize_progress()
