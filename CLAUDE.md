@@ -31,7 +31,7 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 - **`Project`** (= Slack Channel) — Session container. Created automatically when a task starts. `ClaudeCodeRunner.projects` dict maps `channel_id → Project`.
 
-- **`Session`** (= Slack Thread) — Created automatically when a task starts. Contains a serial chain of tasks. Holds `claude_session_id` (for `--resume`), label (emoji + name), `working_dir` (required, set at task creation), and `next_tools` (one-shot tool overrides). Sessions are volatile (not persisted).
+- **`Session`** (= Slack Thread) — Created automatically when a task starts. Contains a serial chain of tasks. Holds `claude_session_id` (for `--resume`), label (emoji + name), `working_dir` (required, set at task creation), and `next_tools` (one-shot tool overrides). Sessions are persisted to `sessions.json` for `--resume` restoration after bridge restart.
 
 - **`Task`** (= Single Instruction → Completion) — One Claude Code subprocess invocation. Holds process handle, PTY master fd, tool call history, and `user_id`. Tasks within a session run serially. Thread replies automatically create new tasks with `--resume`.
 
@@ -55,7 +55,7 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 2. Channel/user whitelist check → mention detection / thread reply routing → command parsing
 3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
 4. Thread spawns `claude -p --verbose` subprocess with PTY, pipes prompt via stdin. Thread replies to existing sessions automatically use `--resume <session.claude_session_id>`
-5. JSONL output file is monitored for progress; session's `claude_session_id` is updated from JSONL entries
+5. JSONL output file is monitored for progress (including subagent JSONL files under `subagents/`); session's `claude_session_id` is updated from JSONL entries
 6. On completion/failure, posts final result to Slack thread
 
 ### Session Continuity
@@ -65,7 +65,8 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 ### Persistence
 
 - `directory_history.json` — Per-channel directory usage history (channel_id → [dir_path, ...]). Max 10 entries per channel.
-- Sessions and Tasks are volatile (in-memory only, lost on bridge restart).
+- `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. Expired sessions (>30 days) are pruned.
+- Tasks are volatile (in-memory only, lost on bridge restart).
 
 ## Language
 
