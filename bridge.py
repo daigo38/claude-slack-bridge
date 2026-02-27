@@ -2017,10 +2017,12 @@ class ClaudeCodeRunner:
             return {}
 
     def save_sessions(self):
-        """セッション情報を永続化"""
+        """セッション情報を永続化（未ロードチャンネルの既存データを保持）"""
         now = datetime.now()
         cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
-        data: dict[str, dict[str, dict]] = {}
+        # 既存のファイルデータを読み込み（未ロードチャンネルのセッション保持）
+        data = self.load_sessions()
+        # メモリ上のプロジェクトでデータを上書き
         for channel_id, project in self.projects.items():
             channel_sessions: dict[str, dict] = {}
             for thread_ts, session in project.sessions.items():
@@ -2047,6 +2049,20 @@ class ClaudeCodeRunner:
                 channel_sessions = dict(sorted_items[-SESSIONS_MAX_PER_CHANNEL:])
             if channel_sessions:
                 data[channel_id] = channel_sessions
+            else:
+                data.pop(channel_id, None)
+        # 未ロードチャンネルの古いセッションも期限切れ削除
+        for channel_id in list(data.keys()):
+            if channel_id in self.projects:
+                continue  # 上で処理済み
+            filtered = {
+                ts: s for ts, s in data[channel_id].items()
+                if s.get("created_at", "") >= cutoff.isoformat()
+            }
+            if filtered:
+                data[channel_id] = filtered
+            else:
+                del data[channel_id]
         try:
             with open(SESSIONS_FILE, "w") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
