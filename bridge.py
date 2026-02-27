@@ -834,6 +834,14 @@ def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
                     results.append(("question", formatted, meta))
                     continue
 
+            # Task（サブエージェント）表示改善
+            if tool_name == "Task":
+                desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
+                stype = tool_input.get("subagent_type", "") if isinstance(tool_input, dict) else ""
+                label = f"{stype}: {desc}" if stype and desc else (desc or stype or "subagent")
+                results.append(("status", f":robot_face: `Task` {label}", None))
+                continue
+
             summary = _summarize_input(tool_input) if isinstance(tool_input, dict) else str(tool_input)[:80]
             if summary:
                 results.append(("status", f":wrench: `{tool_name}` {summary}", None))
@@ -969,6 +977,36 @@ def _read_new_jsonl_entries(jsonl_path: str, file_offset: int) -> tuple[list[dic
     return entries, file_offset
 
 
+def _read_subagent_jsonl_entries(
+    subagents_dir: str,
+    offsets: dict[str, int],
+) -> list[tuple[str, dict]]:
+    """サブエージェントJSONLファイルから新しいエントリを読み取る。
+    返り値: [(agent_label, entry), ...]
+    offsets: {filepath: byte_offset} — 読み取り済み位置を追跡（呼出側で保持）
+    """
+    if not subagents_dir or not os.path.isdir(subagents_dir):
+        return []
+    results = []
+    try:
+        files = [f for f in os.listdir(subagents_dir) if f.startswith("agent-") and f.endswith(".jsonl")]
+    except OSError:
+        return []
+    for fname in files:
+        fpath = os.path.join(subagents_dir, fname)
+        if fpath not in offsets:
+            offsets[fpath] = 0
+        entries, new_offset = _read_new_jsonl_entries(fpath, offsets[fpath])
+        offsets[fpath] = new_offset
+        for entry in entries:
+            agent_id = entry.get("message", {}).get("agentId", "") if isinstance(entry.get("message"), dict) else ""
+            if not agent_id:
+                agent_id = entry.get("agentId", "")
+            label = agent_id[:6] if agent_id else fname.replace("agent-", "").replace(".jsonl", "")[:6]
+            results.append((label, entry))
+    return results
+
+
 def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: WebClient):
     """セッションJSONLファイルをポーリングし、新しいエントリをSlackに投稿。
     - thinking/tool_use → 1つのステータスメッセージをchat_updateで更新（:hourglass:付き）
@@ -994,6 +1032,12 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
     pty_pending_cleaned: bool = False  # PTY pending cleanup 追跡
+
+    # サブエージェント監視
+    jsonl_dir = os.path.dirname(jsonl_path) if jsonl_path else ""
+    session_id_for_subagents = os.path.splitext(os.path.basename(jsonl_path))[0] if jsonl_path else ""
+    subagents_dir = os.path.join(jsonl_dir, session_id_for_subagents, "subagents") if jsonl_path else ""
+    subagent_offsets: dict[str, int] = {}
 
     def _extract_task_info(entry: dict):
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
@@ -1148,6 +1192,20 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
         new_entries, file_offset = _read_new_jsonl_entries(jsonl_path, file_offset)
         if not new_entries:
+            # サブエージェントJSONLのみ活動がある場合もチェック
+            if subagents_dir:
+                sub_entries = _read_subagent_jsonl_entries(subagents_dir, subagent_offsets)
+                if sub_entries:
+                    has_sub_status = False
+                    for agent_label, entry in sub_entries:
+                        for category, text, metadata in _classify_jsonl_entry(entry):
+                            if category == "status":
+                                status_lines.append(f"  ↳ {text}")
+                                has_sub_status = True
+                    if has_sub_status:
+                        _flush_progress()
+                    continue
+
             # JONLに新しいデータなし → CLIが入力待ちの可能性
             # Terminal内容を読んで許可プロンプトを検出（ttyがある場合のみ）
             tty = inst.get("tty")
@@ -1188,6 +1246,15 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     latest_text = None
                     has_status = False
 
+        # サブエージェントJSONL監視
+        if subagents_dir:
+            sub_entries = _read_subagent_jsonl_entries(subagents_dir, subagent_offsets)
+            for agent_label, entry in sub_entries:
+                for category, text, metadata in _classify_jsonl_entry(entry):
+                    if category == "status":
+                        status_lines.append(f"  ↳ {text}")
+                        has_status = True
+
         # 全エントリ処理後にまとめて更新
         if text_parts:
             _update_text("\n".join(text_parts))
@@ -1217,6 +1284,14 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     status_lines = []
                     latest_text = None
                     has_status = False
+        # サブエージェントJSONL残りエントリ処理
+        if subagents_dir:
+            sub_entries = _read_subagent_jsonl_entries(subagents_dir, subagent_offsets)
+            for agent_label, entry in sub_entries:
+                for category, text, metadata in _classify_jsonl_entry(entry):
+                    if category == "status":
+                        status_lines.append(f"  ↳ {text}")
+                        has_status = True
         if text_parts:
             _update_text("\n".join(text_parts))
         elif has_status:
