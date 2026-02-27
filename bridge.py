@@ -1389,6 +1389,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     # ステータス履歴と進捗メッセージtsをinstに格納（_executeで使用）
     inst["_status_history"] = all_status_history
     inst["_status_msg_ts"] = status_msg_ts
+    logger.debug("_monitor_session_jsonl: finished, history_len=%d status_msg_ts=%s thread=%s",
+                 len(all_status_history), status_msg_ts, thread_ts)
 
     # プロセス終了通知（外部インスタンス用）
     if not skip_exit:
@@ -2451,14 +2453,16 @@ class ClaudeCodeRunner:
             if not jsonl_path:
                 logger.warning("_execute: JSONL file not found (process exited) pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
 
-            # JSONL監視（プロセスがまだ実行中の場合）
+            # JSONL監視（プロセス終了後でも残りエントリを処理してステータス履歴を取得する）
             jsonl_monitored = False
-            if jsonl_path and proc.poll() is not None:
-                logger.debug("_execute: JSONL found but process already exited pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
-            if jsonl_path and proc.poll() is None:
+            if jsonl_path:
                 # 既存ファイル（resume追記）: 既存内容をスキップして新規エントリのみ読む
                 # 新規ファイル: 先頭から読む
                 start_from_beginning = not jsonl_is_existing
+                if proc.poll() is not None:
+                    # プロセス既終了 — 全エントリを読み取るため先頭から開始
+                    start_from_beginning = True
+                    logger.debug("_execute: JSONL found but process already exited, reading from beginning pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
                 if registered_thread_ts and registered_thread_ts in instance_threads:
                     inst = instance_threads[registered_thread_ts]
                     inst["jsonl_path"] = jsonl_path
@@ -2615,22 +2619,33 @@ class ClaudeCodeRunner:
     def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
         """タスク完了時: ステータス履歴をスニペット投稿し、進捗メッセージを削除"""
         if not inst:
+            logger.debug("_cleanup_status_message: inst is None, skipping thread=%s", session.thread_ts)
             return
         all_status_history = inst.get("_status_history", [])
         status_msg_ts = inst.get("_status_msg_ts")
+        logger.debug("_cleanup_status_message: history_len=%d status_msg_ts=%s thread=%s",
+                     len(all_status_history), status_msg_ts, session.thread_ts)
 
         # ステータス履歴が十分にあればスニペットとして投稿
         if len(all_status_history) >= 3:
+            snippet_content = "\n".join(all_status_history)
             try:
                 self.client.files_upload_v2(
                     channel=session.channel_id,
                     thread_ts=session.thread_ts or None,
-                    content="\n".join(all_status_history),
+                    content=snippet_content,
                     filename=f"progress_{task.short_id}.txt",
                     title=t("status_history_title"),
                 )
             except Exception as e:
                 logger.error("Status history upload error: %s", e)
+                # フォールバック: テキストメッセージとして投稿
+                try:
+                    max_len = MAX_SLACK_MSG_LENGTH - 50
+                    preview = snippet_content if len(snippet_content) <= max_len else snippet_content[:max_len] + "\n…"
+                    self._post_to_session(session, f"```\n{preview}\n```")
+                except Exception as e2:
+                    logger.error("Status history fallback post also failed: %s", e2)
 
         # 進捗メッセージを削除（ベストエフォート）
         if status_msg_ts:
