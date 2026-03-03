@@ -13,6 +13,11 @@ Tasks are started with a directory specified at invocation time via three method
 - `@bot fork <PID> [<task>]` — fork a running Claude CLI process
 - `@bot <task>` — select from fork candidates / directory history in a thread
 
+Terminal-Slack bidirectional sync:
+- `@bot bind <PID>` — live-connect to a running terminal Claude CLI process (JSONL monitoring + input forwarding via AppleScript)
+- `@bot bind` — list bindable processes
+- Auto-takeover: when a terminal user `claude --resume`s a bridge-spawned session, the bridge detects it and switches to bind mode automatically. The user can find the session via `claude --resume` (no args) which opens an interactive picker listing recent sessions.
+
 ## Running
 
 The bridge runs as a macOS LaunchAgent (`com.user.claude-slack-bridge`). Use `scripts/install.sh` for initial setup.
@@ -57,13 +62,17 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 - **fork** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. `fork <PID>` integrates a running process into the Project+Session model with I/O forwarding while alive and `--resume` continuation after death.
 
+- **bind** — Live bidirectional connection to a terminal Claude CLI process. `bind <PID>` creates a Slack thread that mirrors the terminal session. Output is monitored via JSONL (or terminal output fallback). Slack thread replies are forwarded to the terminal via AppleScript clipboard+paste. When the bound process dies, the session transitions to `--resume` mode. Selection state is stored in `pending_bind_selections`.
+
+- **External takeover** — When a bridge-spawned task is running and an external `claude --resume` process is detected with the same `session_id`, the bridge kills its subprocess, switches the `inst` to the external process, and continues monitoring. Detected periodically (every ~15s) inside `_monitor_session_jsonl`. Note: Slack thread displays a truncated session ID (first 12 chars) for reference only — to resume from terminal, use `claude --resume` without args to open the interactive session picker.
+
 - **Bare task** — When `@bot <task>` is sent without `in` or `fork`, `_handle_bare_task` shows fork candidates and directory history for selection. Selection state is stored in `pending_directory_requests`.
 
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`
 2. Channel/user whitelist check → mention detection / thread reply routing → command parsing
-3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
+3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. `bind` → `_handle_bind` / `_handle_bind_list` → `_execute_bind`. Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
 4. Thread spawns `claude -p --verbose` subprocess with PTY, pipes prompt via stdin. Thread replies to existing sessions automatically use `--resume <session.claude_session_id>`
 5. JSONL output file is monitored for progress (including subagent JSONL files under `subagents/`); session's `claude_session_id` is updated from JSONL entries
 6. On completion/failure, posts final result to Slack thread

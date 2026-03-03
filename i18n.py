@@ -14,6 +14,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot in <path> <タスク>` → 指定ディレクトリでタスクを実行\n"
             "• `@bot fork <PID> [<タスク>]` → 実行中のclaude CLIプロセスをフォーク\n"
             "• `@bot fork` → フォーク可能なプロセス一覧\n"
+            "• `@bot bind <PID>` → ターミナルのclaude CLIにライブ接続\n"
+            "• `@bot bind` → バインド可能なプロセス一覧\n"
             "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
             "*スレッド返信:*\n"
             "• `<指示>` → 同セッションで自動続行（メンション不要）\n"
@@ -109,6 +111,39 @@ MESSAGES: dict[str, dict[str, str]] = {
             "_このスレッドに返信すると同じ文脈で新しいタスクを実行します_"
         ),
 
+        # ── bind ──
+        "bind_no_instances": ":mag: 実行中のclaude CLIインスタンスが見つかりません",
+        "bind_pid_already_tracked": ":warning: PID {pid} は既に追跡中です",
+        "bind_pid_not_found": ":warning: PID {pid} が見つかりません",
+        "bind_no_bindable": ":mag: バインド可能なclaude CLIインスタンスはありません",
+        "bind_list_header": ":computer: *バインド可能なclaude CLIインスタンス:*",
+        "bind_select_or_cancel": "\n番号を入力して選択、または `cancel` でキャンセル",
+        "bind_cancelled": ":x: バインド選択をキャンセルしました",
+        "bind_pid_exited": ":warning: PID {pid} は既に終了しています",
+        "bind_start": (
+            ":link: PID {pid} にバインドしました（ライブI/O）\n"
+            ":file_folder: `{cwd}`{sid_info}\n"
+            "_ターミナルの出力がこのスレッドに表示されます。返信で入力を転送できます_"
+        ),
+        "bind_free_input_sent": ":arrow_right: PID {pid} にテキストを送信しました",
+        "bind_session_takeover": (
+            ":arrows_counterclockwise: ターミナル (PID {pid}) がセッションを引き継ぎました\n"
+            "_このスレッドへの返信はターミナルに転送されます_"
+        ),
+        "bind_session_takeover_ended": (
+            ":stop_button: ターミナル (PID {pid}) のセッションが終了しました\n"
+            "_このスレッドに返信すると --resume で続行します_"
+        ),
+        "external_takeover": (
+            ":desktop_computer: ターミナル (PID {pid}) がこのセッションを引き継ぎました\n"
+            "_Slack側のタスクは中断されました。ターミナルでの操作が完了するまでお待ちください。\n"
+            "ターミナル終了後、このスレッドに返信すると --resume で続行できます_"
+        ),
+        "external_takeover_ended": (
+            ":white_check_mark: ターミナル (PID {pid}) でのセッションが終了しました\n"
+            "_このスレッドに返信すると --resume で続行できます_"
+        ),
+
         # ── session ──
         "session_no_history": "セッション履歴はまだありません",
         "session_list_header": ":clipboard: *セッション一覧*",
@@ -188,6 +223,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot in <path> <task>` → Run a task in the specified directory\n"
             "• `@bot fork <PID> [<task>]` → Fork a running Claude CLI process\n"
             "• `@bot fork` → List forkable processes\n"
+            "• `@bot bind <PID>` → Live-connect to a terminal Claude CLI\n"
+            "• `@bot bind` → List bindable processes\n"
             "• `@bot <task>` → Run from directory selection\n"
             "*Thread replies:*\n"
             "• `<instruction>` → Continue in same session (no mention needed)\n"
@@ -281,6 +318,39 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":fork_and_knife: Inherited context from PID {pid}\n"
             ":file_folder: `{cwd}`{sid_info}\n"
             "_Reply to this thread to run new tasks in the same context_"
+        ),
+
+        # ── bind ──
+        "bind_no_instances": ":mag: No running Claude CLI instances found",
+        "bind_pid_already_tracked": ":warning: PID {pid} is already being tracked",
+        "bind_pid_not_found": ":warning: PID {pid} not found",
+        "bind_no_bindable": ":mag: No bindable Claude CLI instances available",
+        "bind_list_header": ":computer: *Bindable Claude CLI instances:*",
+        "bind_select_or_cancel": "\nEnter a number to select, or `cancel` to abort",
+        "bind_cancelled": ":x: Bind selection cancelled",
+        "bind_pid_exited": ":warning: PID {pid} has already exited",
+        "bind_start": (
+            ":link: Bound to PID {pid} (live I/O)\n"
+            ":file_folder: `{cwd}`{sid_info}\n"
+            "_Terminal output will appear in this thread. Reply to forward input._"
+        ),
+        "bind_free_input_sent": ":arrow_right: Text sent to PID {pid}",
+        "bind_session_takeover": (
+            ":arrows_counterclockwise: Terminal (PID {pid}) has taken over the session\n"
+            "_Replies to this thread will be forwarded to the terminal_"
+        ),
+        "bind_session_takeover_ended": (
+            ":stop_button: Terminal (PID {pid}) session has ended\n"
+            "_Reply to this thread to continue with --resume_"
+        ),
+        "external_takeover": (
+            ":desktop_computer: Terminal (PID {pid}) has taken over this session\n"
+            "_The Slack task has been suspended. Please wait until the terminal operation completes.\n"
+            "After the terminal exits, reply to this thread to continue with --resume_"
+        ),
+        "external_takeover_ended": (
+            ":white_check_mark: Terminal (PID {pid}) session has ended\n"
+            "_Reply to this thread to continue with --resume_"
         ),
 
         # ── session ──

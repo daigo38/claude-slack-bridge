@@ -1257,8 +1257,40 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             metadata["questions"][0]["is_plan_approval"] = True
         _post_question(question_text, metadata)
 
+    # 外部テイクオーバー検出用カウンタ（bridge起動タスクのみ）
+    _takeover_poll_count = 0
+    _TAKEOVER_CHECK_INTERVAL = 5  # 5ポール（約15秒）ごとにチェック
+
     while _is_process_alive(pid):
         time.sleep(TERMINAL_POLL_INTERVAL)
+
+        # 外部テイクオーバー検出（bridge起動タスクのみ、定期チェック）
+        if task_ref and task_ref.process and inst.get("bind_mode") != "live":
+            _takeover_poll_count += 1
+            if _takeover_poll_count >= _TAKEOVER_CHECK_INTERVAL:
+                _takeover_poll_count = 0
+                session_ref = inst.get("session")
+                if session_ref:
+                    external = _detect_external_takeover(inst, session_ref)
+                    if external:
+                        _handle_external_takeover(inst, external, session_ref,
+                                                  thread_ts, channel, client)
+                        # inst が更新されたので pid を差し替えて監視を継続
+                        pid = inst["pid"]
+                        jsonl_path = inst.get("jsonl_path", jsonl_path)
+                        fixed_jsonl = inst.get("fixed_jsonl", False)
+                        skip_exit = inst.get("skip_exit_message", False)
+                        display_prefix = inst.get("display_prefix", display_prefix)
+                        # JSONL オフセットをリセット（既存内容はスキップ）
+                        try:
+                            file_offset = os.path.getsize(jsonl_path)
+                        except OSError:
+                            pass
+                        _finalize_progress()
+                        status_msg_ts = None
+                        status_lines = []
+                        latest_text = None
+                        continue
 
         # 新しい入力があればステータスをリセット（新しいメッセージ群を開始）
         if "input_msg_ts" in inst:
@@ -1455,11 +1487,13 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     # プロセス終了通知（外部インスタンス用）
     if not skip_exit:
+        # 外部テイクオーバーで引き継がれたプロセスの終了は専用メッセージ
+        exit_key = "external_takeover_ended" if inst.get("external_takeover") else "session_pid_exited"
         try:
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=t("session_pid_exited", pid=pid),
+                text=t(exit_key, pid=pid),
             )
         except Exception:
             pass
@@ -2048,6 +2082,12 @@ class ClaudeCodeRunner:
 
             proc.wait()
 
+            # 外部テイクオーバーによる終了: 既にCOMPLETED設定済み
+            if task.status == TaskStatus.COMPLETED and inst and inst.get("bind_mode") == "live":
+                logger.info("_execute: task ended via external takeover, skipping completion flow thread=%s", thread_ts)
+                self._cleanup_status_message(inst, session, task)
+                return
+
             if task.status == TaskStatus.CANCELLED:
                 self._post_completion(session, task,
                                       f"{display_label}  {t('task_cancelled')}", inst)
@@ -2108,15 +2148,17 @@ class ClaudeCodeRunner:
             self._cleanup_status_message(inst, session, task)
 
         finally:
-            if jsonl_path:
+            # テイクオーバー時はバインド監視スレッドが管理するため除去しない
+            is_takeover = inst and inst.get("bind_mode") == "live"
+            if jsonl_path and not is_takeover:
                 _monitored_jsonl_paths.discard(jsonl_path)
-            if master_fd is not None:
+            if master_fd is not None and not is_takeover:
                 try:
                     os.close(master_fd)
                 except OSError:
                     pass
                 task.master_fd = None
-            if registered_thread_ts:
+            if registered_thread_ts and not is_takeover:
                 instance_threads.pop(registered_thread_ts, None)
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
@@ -2384,8 +2426,14 @@ _monitored_jsonl_paths: set[str] = set()
 # fork の複数候補選択状態（channel_id → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
 
+# bind の複数候補選択状態（channel_id → 選択情報）
+pending_bind_selections: dict[str, dict] = {}
+
 # ベアタスクのディレクトリ選択待ち状態（thread_ts → 選択情報）
 pending_directory_requests: dict[str, dict] = {}
+
+# シャットダウンイベント（バックグラウンドスレッド停止用）
+_shutdown_event = threading.Event()
 
 
 BOT_USER_ID = None
@@ -2542,6 +2590,14 @@ def handle_message(event, say):
             if _handle_fork_selection(fork_input, say, channel_id):
                 return
 
+        # バインド選択割り込み
+        if channel_id in pending_bind_selections:
+            bind_input = _strip_bot_mention(text)
+            if bind_input == text:
+                bind_input = text
+            if _handle_bind_selection(bind_input, say, channel_id):
+                return
+
         # トップレベルメッセージ: botメンション必須
         stripped = _strip_bot_mention(text)
         if stripped == text:
@@ -2687,6 +2743,15 @@ def _dispatch_command(text: str, event: dict, say):
             _handle_fork_list(say, thread_ts, channel_id, user_id)
         else:
             _handle_fork(rest, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
+        return
+
+    # ── bind [<PID>] ──
+    if cmd_lower == "bind" or cmd_lower.startswith("bind "):
+        rest = text[4:].strip()
+        if not rest:
+            _handle_bind_list(say, thread_ts, channel_id, user_id)
+        else:
+            _handle_bind(rest, say, thread_ts, channel_id, user_id)
         return
 
     # ── tools <list> （トップレベルではエラー） ──
@@ -3406,6 +3471,566 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# bind コマンド — ターミナルのclaude CLIにライブ接続
+# ---------------------------------------------------------------------------
+
+def _handle_bind(rest: str, say, thread_ts, channel_id: str, user_id: str):
+    """bind <PID> — 実行中のclaude CLIプロセスにライブ接続"""
+    try:
+        target_pid = int(rest.strip())
+    except ValueError:
+        say(text=t("error_pid_not_number"), thread_ts=thread_ts)
+        return
+
+    instances = detect_running_claude_instances()
+    if not instances:
+        say(text=t("bind_no_instances"), thread_ts=thread_ts)
+        return
+
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids]
+
+    matched = [i for i in candidates if i["pid"] == target_pid]
+    if not matched:
+        if target_pid in tracked_pids:
+            say(text=t("bind_pid_already_tracked", pid=target_pid), thread_ts=thread_ts)
+        else:
+            say(text=t("bind_pid_not_found", pid=target_pid), thread_ts=thread_ts)
+        return
+
+    _execute_bind(matched[0], channel_id, say, thread_ts, user_id)
+
+
+def _handle_bind_list(say, thread_ts, channel_id: str, user_id: str):
+    """bind（引数なし）: バインド可能なプロセスリスト表示"""
+    instances = detect_running_claude_instances()
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
+
+    if not candidates:
+        say(text=t("bind_no_bindable"), thread_ts=thread_ts)
+        return
+
+    lines = [t("bind_list_header")]
+    for i, inst in enumerate(candidates, 1):
+        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+    lines.append(t("bind_select_or_cancel"))
+    say(text="\n".join(lines), thread_ts=thread_ts)
+
+    pending_bind_selections[channel_id] = {
+        "instances": candidates,
+        "thread_ts": thread_ts,
+        "user_id": user_id,
+    }
+
+
+def _handle_bind_selection(text: str, say, channel_id: str) -> bool:
+    """pending_bind_selections の番号選択/キャンセルを処理。
+    処理した場合 True、fallthrough の場合 False を返す。"""
+    if channel_id not in pending_bind_selections:
+        return False
+
+    selection = pending_bind_selections[channel_id]
+    instances = selection["instances"]
+    thread_ts = selection["thread_ts"]
+    user_id = selection["user_id"]
+    input_text = text.strip().lower()
+
+    if input_text == "cancel":
+        del pending_bind_selections[channel_id]
+        say(text=t("bind_cancelled"), thread_ts=thread_ts)
+        return True
+
+    try:
+        num = int(input_text)
+    except ValueError:
+        return False
+
+    if num < 1 or num > len(instances):
+        say(text=t("error_enter_number_range", max=len(instances)), thread_ts=thread_ts)
+        return True
+
+    selected = instances[num - 1]
+    del pending_bind_selections[channel_id]
+
+    if not _is_process_alive(selected["pid"]):
+        say(text=t("bind_pid_exited", pid=selected['pid']), thread_ts=thread_ts)
+        return True
+
+    _execute_bind(selected, channel_id, say, thread_ts, user_id)
+    return True
+
+
+def _execute_bind(inst_info: dict, channel_id: str, say, thread_ts, user_id: str):
+    """バインド実行: プロセスのライブI/Oをスレッドに接続"""
+    pid = inst_info["pid"]
+    cwd = inst_info["cwd"]
+    tty = inst_info["tty"]
+
+    # プロセス生存確認
+    if not _is_process_alive(pid):
+        say(text=t("bind_pid_exited", pid=pid), thread_ts=thread_ts)
+        return
+
+    # JONLから session_id を取得
+    jsonl_path = _find_session_jsonl(cwd)
+    session_id = None
+    if jsonl_path:
+        dummy_task = Task(id=0, prompt="(bind)")
+        dummy_session = type("_S", (), {"claude_session_id": None})()
+        _extract_session_info_from_jsonl(dummy_task, dummy_session, jsonl_path)
+        session_id = dummy_session.claude_session_id
+
+    # Project/Session 作成
+    project = runner.get_or_create_project(channel_id)
+
+    # 新しいトップレベルメッセージ（スレッド開始）
+    sid_info = f"\n_Session: `{session_id[:12]}...`_" if session_id else ""
+    resp = slack_client.chat_postMessage(
+        channel=channel_id,
+        text=t("bind_start", pid=pid, cwd=cwd, sid_info=sid_info),
+    )
+    bind_thread_ts = resp["ts"]
+
+    # Session 作成
+    session = project.get_or_create_session(bind_thread_ts)
+    session.working_dir = cwd
+    if session_id:
+        session.claude_session_id = session_id
+    runner.save_sessions()
+    runner.record_directory(channel_id, cwd)
+
+    # instance_threads に登録
+    bind_inst = {
+        "pid": pid,
+        "cwd": cwd,
+        "tty": tty,
+        "session": session,
+        "display_prefix": f"PID {pid}",
+        "skip_exit_message": False,
+        "bind_mode": "live",
+        "fixed_jsonl": False,
+    }
+    if jsonl_path:
+        bind_inst["jsonl_path"] = jsonl_path
+        _monitored_jsonl_paths.add(jsonl_path)
+
+    instance_threads[bind_thread_ts] = bind_inst
+
+    # JSONL監視スレッド起動（JSONL未発見でもfixed_jsonl=Falseで動的に発見）
+    monitor_thread = threading.Thread(
+        target=_bind_monitor_wrapper,
+        args=(bind_inst, bind_thread_ts, channel_id, session, jsonl_path),
+        daemon=True,
+    )
+    monitor_thread.start()
+
+
+def _bind_monitor_wrapper(inst: dict, thread_ts: str, channel_id: str,
+                          session: "Session", jsonl_path: str):
+    """バインド用JSONL監視ラッパー: 監視終了後にクリーンアップ"""
+    try:
+        _monitor_session_jsonl(inst, thread_ts, channel_id, slack_client)
+    except Exception as e:
+        logger.error("Bind JSONL monitor error: %s", e, exc_info=True)
+    finally:
+        _monitored_jsonl_paths.discard(jsonl_path)
+        instance_threads.pop(thread_ts, None)
+        logger.info("Bind monitor ended: pid=%s thread=%s", inst.get("pid"), thread_ts)
+
+
+_bridge_pid = os.getpid()
+
+def _is_descendant_of_bridge(pid: int) -> bool:
+    """pidがbridgeプロセスの子孫かどうかをPPIDチェーンで判定。
+    bridgeが起動したサブプロセスやそのサブエージェント等を除外するために使用。"""
+    current = pid
+    visited = set()
+    while current > 1:
+        if current == _bridge_pid:
+            return True
+        if current in visited:
+            break  # ループ防止
+        visited.add(current)
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(current), "-o", "ppid="],
+                capture_output=True, text=True, timeout=5,
+            )
+            ppid_str = result.stdout.strip()
+            if not ppid_str:
+                break
+            current = int(ppid_str)
+        except Exception:
+            break
+    return False
+
+
+def _detect_external_takeover(inst: dict, session: "Session") -> Optional[dict]:
+    """bridge起動タスク実行中に、同じsession_idで外部プロセスが起動したか検出。
+    検出した場合、外部インスタンス情報を返す。"""
+    session_id = session.claude_session_id
+    if not session_id:
+        return None
+    bridge_pid = inst.get("pid")
+    bridge_jsonl = inst.get("jsonl_path")
+
+    instances = detect_running_claude_instances()
+    for ext_inst in instances:
+        if ext_inst["pid"] == bridge_pid:
+            continue
+        # bridgeプロセスの子孫（サブエージェント等）は外部ではない
+        if _is_descendant_of_bridge(ext_inst["pid"]):
+            continue
+        # 外部プロセスのJSONLからsession_idを確認
+        ext_jsonl = _find_session_jsonl(ext_inst["cwd"], exclude_paths=_monitored_jsonl_paths)
+        if not ext_jsonl:
+            # 未監視のJSONLが見つからない場合:
+            # 正規テイクオーバー（--resume で同じセッションを再開）の可能性をチェック。
+            # --resume プロセスは既存のJSONLファイル（bridge監視中）に書き込むため、
+            # exclude_pathsで除外されてここに来る。
+            if not bridge_jsonl:
+                continue
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(ext_inst["pid"]), "-o", "args="],
+                    capture_output=True, text=True, timeout=5,
+                )
+                args_str = result.stdout.strip()
+                if "--resume" not in args_str:
+                    continue  # 新規セッション → テイクオーバーではない
+                # --resume の引数から session_id を確認
+                tokens = args_str.split()
+                resume_sid = None
+                for idx, tok in enumerate(tokens):
+                    if tok == "--resume" and idx + 1 < len(tokens):
+                        candidate = tokens[idx + 1]
+                        if not candidate.startswith("-"):
+                            resume_sid = candidate
+                        break
+                if resume_sid is not None:
+                    # 明示的にセッションIDが指定されている場合: 完全一致 or 前方一致
+                    if resume_sid != session_id and not session_id.startswith(resume_sid):
+                        continue  # 別セッションの --resume → テイクオーバーではない
+                else:
+                    # --resume 引数なし（対話的ピッカー使用）の場合:
+                    # lsof で外部プロセスが bridge の JSONL を開いているか確認。
+                    # detect_running_claude_instances() で claude プロセスに限定済み。
+                    try:
+                        lsof_result = subprocess.run(
+                            ["lsof", "-p", str(ext_inst["pid"]), "-F", "n"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if not any(line.startswith(f"n{bridge_jsonl}")
+                                   for line in lsof_result.stdout.splitlines()):
+                            continue  # bridge の JSONL を開いていない → 別セッション
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+            ext_jsonl = bridge_jsonl
+        try:
+            with open(ext_jsonl, "r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= 10:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = entry.get("message", {})
+                    sid = (msg.get("sessionId") if isinstance(msg, dict) else None) or entry.get("sessionId")
+                    if sid == session_id:
+                        return {
+                            "pid": ext_inst["pid"],
+                            "cwd": ext_inst["cwd"],
+                            "tty": ext_inst["tty"],
+                            "etime": ext_inst["etime"],
+                            "jsonl_path": ext_jsonl,
+                        }
+        except OSError:
+            continue
+    return None
+
+
+def _handle_external_takeover(inst: dict, external: dict, session: "Session",
+                              thread_ts: str, channel_id: str, client: WebClient):
+    """外部プロセスがセッションを引き継いだ場合の処理:
+    bridge起動のサブプロセスを終了し、外部プロセスの監視に切り替える。"""
+    import signal
+    old_pid = inst.get("pid")
+    new_pid = external["pid"]
+
+    logger.info("External takeover detected: old_pid=%s new_pid=%s session=%s thread=%s",
+                old_pid, new_pid, session.claude_session_id[:16] if session.claude_session_id else "?", thread_ts)
+
+    # bridge起動のサブプロセスを終了
+    task_ref = inst.get("task")
+    if task_ref and task_ref.process and task_ref.process.poll() is None:
+        try:
+            task_ref.process.send_signal(signal.SIGTERM)
+            try:
+                task_ref.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                task_ref.process.kill()
+                task_ref.process.wait(timeout=3)
+        except Exception as e:
+            logger.warning("Failed to kill bridge subprocess pid=%s: %s", old_pid, e)
+
+    # master_fd をクローズ
+    old_master_fd = inst.pop("master_fd", None)
+    if old_master_fd is not None:
+        try:
+            os.close(old_master_fd)
+        except OSError:
+            pass
+        if task_ref:
+            task_ref.master_fd = None
+
+    # inst を外部プロセスに更新
+    inst["pid"] = new_pid
+    inst["cwd"] = external["cwd"]
+    inst["tty"] = external["tty"]
+    inst["bind_mode"] = "live"
+    inst["external_takeover"] = True
+    inst["skip_exit_message"] = False
+    if external.get("jsonl_path"):
+        inst["jsonl_path"] = external["jsonl_path"]
+        inst["fixed_jsonl"] = False
+
+    # タスクステータスを更新
+    if task_ref:
+        task_ref.status = TaskStatus.COMPLETED
+        task_ref.completed_at = datetime.now()
+
+    # Slack通知（外部テイクオーバー専用メッセージ）
+    try:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=t("external_takeover", pid=new_pid),
+        )
+    except Exception:
+        pass
+
+
+# ── アイドルセッション外部テイクオーバー検出 ──────────────────
+
+_IDLE_TAKEOVER_INTERVAL = 15  # 秒（アクティブタスクの検出間隔と同程度）
+
+
+def _check_idle_session_takeovers():
+    """全アイドルセッションに対して外部テイクオーバーを検出し、bind監視を開始する。"""
+    # 1. runner.projects から全セッションを収集
+    #    - claude_session_id がある
+    #    - instance_threads に未登録（アイドル状態）
+    active_thread_tss = set(instance_threads.keys())
+    known_sessions: dict[str, tuple["Session", "Project"]] = {}
+    for channel_id, project in list(runner.projects.items()):
+        for thread_ts, session in list(project.sessions.items()):
+            if not session.claude_session_id:
+                continue
+            if thread_ts in active_thread_tss:
+                continue  # アクティブなタスクまたはbind中
+            sid = session.claude_session_id
+            # 同一session_idが複数ある場合、最新のセッションを優先
+            if sid in known_sessions:
+                existing_session = known_sessions[sid][0]
+                if session.created_at > existing_session.created_at:
+                    known_sessions[sid] = (session, project)
+            else:
+                known_sessions[sid] = (session, project)
+
+    if not known_sessions:
+        return
+
+    # 2. 外部claudeプロセスを取得
+    instances = detect_running_claude_instances()
+    if not instances:
+        return
+
+    # 3. フィルタ: bridge子孫 / instance_threadsのアクティブPID を除外
+    active_pids = {inst.get("pid") for inst in instance_threads.values() if inst.get("pid")}
+    candidates = []
+    for ext in instances:
+        if ext["pid"] in active_pids:
+            continue
+        if _is_descendant_of_bridge(ext["pid"]):
+            continue
+        candidates.append(ext)
+
+    if not candidates:
+        return
+
+    # 4. 各候補の --resume 引数をチェック
+    for ext in candidates:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(ext["pid"]), "-o", "args="],
+                capture_output=True, text=True, timeout=5,
+            )
+            args_str = result.stdout.strip()
+            if "--resume" not in args_str:
+                continue  # 新規セッションはテイクオーバーではない
+
+            # --resume の引数からsession_idを確認
+            tokens = args_str.split()
+            resume_sid = None
+            for idx, tok in enumerate(tokens):
+                if tok == "--resume" and idx + 1 < len(tokens):
+                    candidate_tok = tokens[idx + 1]
+                    if not candidate_tok.startswith("-"):
+                        resume_sid = candidate_tok
+                    break
+
+            matched_session = None
+            matched_project = None
+
+            if resume_sid is not None:
+                # 明示的にセッションIDが指定: 完全一致 or 前方一致
+                for sid, (session, project) in known_sessions.items():
+                    if resume_sid == sid or sid.startswith(resume_sid):
+                        matched_session = session
+                        matched_project = project
+                        break
+            else:
+                # --resume 引数なし（対話的ピッカー使用）:
+                # lsof で外部プロセスが開いている .jsonl を探し、session_id をマッチ
+                try:
+                    lsof_result = subprocess.run(
+                        ["lsof", "-p", str(ext["pid"]), "-F", "n"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    jsonl_sid = None
+                    for line in lsof_result.stdout.splitlines():
+                        if line.startswith("n") and line.endswith(".jsonl"):
+                            jsonl_file = line[1:]  # 'n' プレフィックスを除去
+                            try:
+                                with open(jsonl_file, "r", encoding="utf-8") as f:
+                                    for i, jline in enumerate(f):
+                                        if i >= 10:
+                                            break
+                                        jline = jline.strip()
+                                        if not jline:
+                                            continue
+                                        try:
+                                            entry = json.loads(jline)
+                                        except json.JSONDecodeError:
+                                            continue
+                                        msg = entry.get("message", {})
+                                        sid = (msg.get("sessionId") if isinstance(msg, dict) else None) or entry.get("sessionId")
+                                        if sid and sid in known_sessions:
+                                            jsonl_sid = sid
+                                            ext["_jsonl_path"] = jsonl_file
+                                            break
+                                    if jsonl_sid:
+                                        break
+                            except OSError:
+                                continue
+                    if jsonl_sid:
+                        matched_session, matched_project = known_sessions[jsonl_sid]
+                except Exception:
+                    continue
+
+            if matched_session and matched_project:
+                _initiate_idle_takeover(ext, matched_session, matched_project)
+                # マッチしたsession_idを除去（同一ループで二重処理を防止）
+                known_sessions.pop(matched_session.claude_session_id, None)
+        except Exception as e:
+            logger.debug("Idle takeover check error for PID %s: %s", ext.get("pid"), e)
+            continue
+
+
+def _initiate_idle_takeover(ext: dict, session: "Session", project: "Project"):
+    """アイドルセッションの外部テイクオーバーを開始: 既存スレッドにbind監視を接続する。"""
+    thread_ts = session.thread_ts
+    channel_id = session.channel_id
+    pid = ext["pid"]
+
+    # 競合防止: instance_threads に既に登録されていないか再チェック
+    if thread_ts in instance_threads:
+        return
+
+    logger.info("Idle session takeover detected: pid=%s session=%s thread=%s",
+                pid, session.claude_session_id[:16] if session.claude_session_id else "?", thread_ts)
+
+    # JONLパスを決定
+    jsonl_path = ext.get("_jsonl_path")  # _check_idle_session_takeovers で取得済みの場合
+    if not jsonl_path:
+        # lsof で外部プロセスが開いている .jsonl を探す
+        try:
+            lsof_result = subprocess.run(
+                ["lsof", "-p", str(pid), "-F", "n"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in lsof_result.stdout.splitlines():
+                if line.startswith("n") and line.endswith(".jsonl"):
+                    jsonl_path = line[1:]
+                    break
+        except Exception:
+            pass
+    if not jsonl_path:
+        # フォールバック: セッションのworking_dirからJSONLを探す
+        jsonl_path = _find_session_jsonl(session.working_dir)
+    if not jsonl_path:
+        logger.warning("Idle takeover: no JSONL found for pid=%s session=%s, skipping",
+                       pid, session.claude_session_id[:16] if session.claude_session_id else "?")
+        return
+
+    # inst dict を構築
+    inst = {
+        "pid": pid,
+        "cwd": ext["cwd"],
+        "tty": ext["tty"],
+        "session": session,
+        "display_prefix": f"PID {pid}",
+        "skip_exit_message": False,
+        "bind_mode": "live",
+        "jsonl_path": jsonl_path,
+        "fixed_jsonl": False,
+    }
+
+    # instance_threads に登録（再チェック付き）
+    if thread_ts in instance_threads:
+        return  # 別スレッドが先に登録した
+    instance_threads[thread_ts] = inst
+    _monitored_jsonl_paths.add(jsonl_path)
+
+    # Slack スレッドに通知
+    try:
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=t("bind_session_takeover", pid=pid),
+        )
+    except Exception as e:
+        logger.warning("Idle takeover notification error: %s", e)
+
+    # デーモンスレッドで監視開始
+    monitor_thread = threading.Thread(
+        target=_bind_monitor_wrapper,
+        args=(inst, thread_ts, channel_id, session, jsonl_path),
+        daemon=True,
+    )
+    monitor_thread.start()
+
+
+def _idle_takeover_monitor_loop():
+    """バックグラウンドスレッド: 全アイドルセッションの外部テイクオーバーを定期検出する。"""
+    while not _shutdown_event.is_set():
+        _shutdown_event.wait(_IDLE_TAKEOVER_INTERVAL)
+        if _shutdown_event.is_set():
+            break
+        try:
+            _check_idle_session_takeovers()
+        except Exception as e:
+            logger.error("Idle takeover monitor error: %s", e, exc_info=True)
+
+
 def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str):
     """ベアタスク: ルート設定時は即実行、なければフォーク候補 + ディレクトリ履歴を表示し選択を待つ"""
     thread_ts = event.get("ts")
@@ -3552,6 +4177,10 @@ def main():
     total_sessions = sum(len(v) for v in saved_sessions.values())
     logger.info("  Saved Sessions:   %d", total_sessions)
 
+    # アイドルテイクオーバー検出のため全プロジェクトを事前ロード
+    for channel_id in saved_sessions:
+        runner.get_or_create_project(channel_id)
+
     # 起動通知
     if NOTIFICATION_CHANNEL:
         try:
@@ -3562,10 +4191,11 @@ def main():
         except Exception as e:
             logger.warning("Failed to send Slack startup notification: %s", e)
 
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN, trace_enabled=True)
 
     def shutdown(signum, frame):
         logger.info("Shutting down...")
+        _shutdown_event.set()
         runner.cancel_all()
         if NOTIFICATION_CHANNEL:
             try:
@@ -3580,6 +4210,10 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    # アイドルセッション外部テイクオーバー監視スレッド起動
+    idle_monitor = threading.Thread(target=_idle_takeover_monitor_loop, daemon=True)
+    idle_monitor.start()
 
     handler.start()
 
