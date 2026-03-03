@@ -257,3 +257,66 @@ class TestProject:
     def test_all_tasks_empty(self, make_project):
         project = make_project()
         assert project.all_tasks == []
+
+
+# ── save_channel_roots ────────────────────────────────────
+
+class TestSaveChannelRoots:
+    """save_channel_roots が未ロードチャンネルのルートを消さないことを確認"""
+
+    def test_preserves_unloaded_channel_roots(self, tmp_path):
+        """メモリにないチャンネルのルートが保存時に消えないこと"""
+        roots_file = tmp_path / "channel_roots.json"
+        import json
+        # 既存データ: チャンネルA, B 両方にルートが設定されている
+        roots_file.write_text(json.dumps({
+            "CH_A": "/path/to/a",
+            "CH_B": "/path/to/b",
+        }))
+
+        runner = bridge.ClaudeCodeRunner.__new__(bridge.ClaudeCodeRunner)
+        runner.projects = {}
+        # チャンネルAだけメモリにロードされている
+        runner.projects["CH_A"] = bridge.Project(channel_id="CH_A", root_dir="/path/to/a_new")
+
+        import bridge as _bridge
+        original = _bridge.CHANNEL_ROOTS_FILE
+        _bridge.CHANNEL_ROOTS_FILE = str(roots_file)
+        try:
+            runner.save_channel_roots()
+        finally:
+            _bridge.CHANNEL_ROOTS_FILE = original
+
+        saved = json.loads(roots_file.read_text())
+        # チャンネルAは更新されている
+        assert saved["CH_A"] == "/path/to/a_new"
+        # チャンネルBは消えていない
+        assert saved["CH_B"] == "/path/to/b"
+
+    def test_clears_root_for_loaded_channel(self, tmp_path):
+        """メモリ上で root_dir=None のチャンネルは保存時に削除されること"""
+        roots_file = tmp_path / "channel_roots.json"
+        import json
+        roots_file.write_text(json.dumps({
+            "CH_A": "/path/to/a",
+            "CH_B": "/path/to/b",
+        }))
+
+        runner = bridge.ClaudeCodeRunner.__new__(bridge.ClaudeCodeRunner)
+        runner.projects = {}
+        # チャンネルAはルートをクリアした状態
+        runner.projects["CH_A"] = bridge.Project(channel_id="CH_A", root_dir=None)
+
+        import bridge as _bridge
+        original = _bridge.CHANNEL_ROOTS_FILE
+        _bridge.CHANNEL_ROOTS_FILE = str(roots_file)
+        try:
+            runner.save_channel_roots()
+        finally:
+            _bridge.CHANNEL_ROOTS_FILE = original
+
+        saved = json.loads(roots_file.read_text())
+        # チャンネルAはクリアされている
+        assert "CH_A" not in saved
+        # チャンネルBは消えていない
+        assert saved["CH_B"] == "/path/to/b"

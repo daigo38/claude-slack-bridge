@@ -2174,11 +2174,15 @@ class ClaudeCodeRunner:
 
     # ── チャンネルルートディレクトリ ──
     def save_channel_roots(self):
-        """チャンネルルート設定を永続化"""
-        roots = {}
+        """チャンネルルート設定を永続化（未ロードチャンネルの既存データを保持）"""
+        # 既存のファイルデータを読み込み（未ロードチャンネルのルート保持）
+        roots = self.load_channel_roots()
+        # メモリ上のプロジェクトでデータを上書き
         for channel_id, project in self.projects.items():
             if project.root_dir:
                 roots[channel_id] = project.root_dir
+            else:
+                roots.pop(channel_id, None)
         try:
             with open(CHANNEL_ROOTS_FILE, "w") as f:
                 json.dump(roots, f, ensure_ascii=False, indent=2)
