@@ -34,8 +34,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── status ──
         "status_thinking": ":thought_balloon: _思考中..._ ({chars}文字)",
         "status_running": ":hourglass_flowing_sand: _実行中..._",
-        "status_thinking_progress": ":hourglass_flowing_sand: _思考中..._",
-        "status_cli_output_pending": ":hourglass: _CLIからの出力（確認中）_",
         "status_no_tasks": ":zzz: このチャンネルにはまだタスクがありません",
         "status_no_running_tasks": ":zzz: 実行中のタスクはありません",
         "status_no_running_with_recent": ":zzz: 実行中のタスクはありません\n*直近の完了タスク:*",
@@ -43,8 +41,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_elapsed_seconds": "({elapsed:.0f}秒)",
         "status_elapsed_tools": "({elapsed:.0f}秒, ツール{tool_count}回)",
         "status_recent_tools": "最近: {tools}",
-        "status_command_completed": "（コマンド実行完了）",
         "status_continued": "...(続き)",
+
+        # ── lifecycle (段階的メッセージ更新) ──
+        "lifecycle_received": ":inbox_tray: *リクエスト受付*",
+        "lifecycle_preparing": ":rocket: *タスク準備中...*",
+        "lifecycle_running": ":gear: *タスク実行中*",
 
         # ── task ──
         "task_start_header": "*タスク開始*",
@@ -123,7 +125,6 @@ MESSAGES: dict[str, dict[str, str]] = {
 
         # ── input (入力転送) ──
         "input_sent": ":arrow_right: PID {pid} に入力を送信しました :white_check_mark:",
-        "input_sent_waiting": ":arrow_right: PID {pid} に入力を送信しました :hourglass_flowing_sand:",
         "input_answer_sent": ":arrow_right: PID {pid} に回答を送信: {label} :white_check_mark:",
         "input_selected_option": "選択肢 {num} ({label}) を選択",
         "input_blocked_task_running": ":hourglass_flowing_sand: タスク実行中のため、新しい指示は受け付けられません。完了後にもう一度返信してください。",
@@ -207,8 +208,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── status ──
         "status_thinking": ":thought_balloon: _Thinking..._ ({chars} chars)",
         "status_running": ":hourglass_flowing_sand: _Running..._",
-        "status_thinking_progress": ":hourglass_flowing_sand: _Thinking..._",
-        "status_cli_output_pending": ":hourglass: _CLI output (pending confirmation)_",
         "status_no_tasks": ":zzz: No tasks in this channel yet",
         "status_no_running_tasks": ":zzz: No running tasks",
         "status_no_running_with_recent": ":zzz: No running tasks\n*Recent completed tasks:*",
@@ -216,8 +215,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_elapsed_seconds": "({elapsed:.0f}s)",
         "status_elapsed_tools": "({elapsed:.0f}s, {tool_count} tool calls)",
         "status_recent_tools": "Recent: {tools}",
-        "status_command_completed": "(command completed)",
         "status_continued": "...(continued)",
+
+        # ── lifecycle ──
+        "lifecycle_received": ":inbox_tray: *Request received*",
+        "lifecycle_preparing": ":rocket: *Preparing task...*",
+        "lifecycle_running": ":gear: *Task running*",
 
         # ── task ──
         "task_start_header": "*Task started*",
@@ -296,7 +299,6 @@ MESSAGES: dict[str, dict[str, str]] = {
 
         # ── input ──
         "input_sent": ":arrow_right: Input sent to PID {pid} :white_check_mark:",
-        "input_sent_waiting": ":arrow_right: Input sent to PID {pid} :hourglass_flowing_sand:",
         "input_answer_sent": ":arrow_right: Answer sent to PID {pid}: {label} :white_check_mark:",
         "input_selected_option": "Option {num} ({label}) selected",
         "input_blocked_task_running": ":hourglass_flowing_sand: A task is currently running. Please reply again after it completes.",

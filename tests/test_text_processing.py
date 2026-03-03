@@ -1,6 +1,6 @@
 """テキスト処理関数のテスト。
 
-対象: _md_to_slack, _strip_ansi, _filter_terminal_ui,
+対象: _md_to_slack, _strip_ansi,
       _augment_prompt_with_files, _strip_bot_mention, _summarize_input
 """
 
@@ -165,55 +165,6 @@ class TestStripAnsi:
         """未知のエスケープシーケンスの残留ESC文字"""
         result = bridge._strip_ansi("text\x1bremainder")
         assert result == "textremainder"
-
-
-# ── _filter_terminal_ui ──────────────────────────────────
-
-class TestFilterTerminalUI:
-    def test_removes_separator(self):
-        result = bridge._filter_terminal_ui("─────────────")
-        assert result == ""
-
-    def test_removes_prompt_line(self):
-        result = bridge._filter_terminal_ui("❯ some prompt")
-        assert result == ""
-
-    def test_removes_status_bar(self):
-        result = bridge._filter_terminal_ui("⏵ running")
-        assert result == ""
-
-    def test_removes_spinner(self):
-        result = bridge._filter_terminal_ui("✶ thinking…")
-        assert result == ""
-
-    def test_removes_timer(self):
-        result = bridge._filter_terminal_ui("(28s)")
-        assert result == ""
-
-    def test_removes_ctrl_hint(self):
-        result = bridge._filter_terminal_ui("ctrl+c to cancel")
-        assert result == ""
-
-    def test_removes_background_hint(self):
-        result = bridge._filter_terminal_ui("press to run in background")
-        assert result == ""
-
-    def test_removes_fold_hint(self):
-        result = bridge._filter_terminal_ui("5 lines (collapsed)")
-        assert result == ""
-
-    def test_keeps_normal_text(self):
-        result = bridge._filter_terminal_ui("Hello world\nThis is real output")
-        assert "Hello world" in result
-        assert "This is real output" in result
-
-    def test_strips_ansi_before_filtering(self):
-        result = bridge._filter_terminal_ui("\x1b[31mhello\x1b[0m")
-        assert result == "hello"
-
-    def test_removes_empty_lines(self):
-        result = bridge._filter_terminal_ui("\n\n\ntext\n\n")
-        assert result == "text"
 
 
 # ── _augment_prompt_with_files ────────────────────────────

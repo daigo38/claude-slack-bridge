@@ -29,8 +29,10 @@ class TestClassifyJsonlEntry:
         assert len(results) == 1
         cat, text, meta = results[0]
         assert cat == "status"
-        assert "思考中" in text
+        assert "thinking" in text
         assert "300" in text  # 300文字
+        assert "```" in text  # コードブロックで全文表示
+        assert "abc" * 100 in text  # thinking全文が含まれる
         assert meta is None
 
     def test_text(self):

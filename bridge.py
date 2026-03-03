@@ -89,7 +89,7 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
     "Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite",
 )
 
-MAX_SLACK_MSG_LENGTH = 39000  # Slack API上限は約40,000文字
+MAX_SLACK_MSG_LENGTH = 39000  # Slack API上限は約40,000文字（JSONエスケープ込み）
 MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 DIRECTORY_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "directory_history.json")
 CHANNEL_ROOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_roots.json")
@@ -506,6 +506,9 @@ class Task:
     # セッション継続（Session.claude_session_id から自動設定）
     resume_session: Optional[str] = None
 
+    # ライフサイクルメッセージ（chat_update で段階的に更新するメッセージのts）
+    lifecycle_msg_ts: Optional[str] = None
+
     @property
     def short_id(self) -> str:
         return f"#{self.id}"
@@ -821,7 +824,12 @@ def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
 
         if entry_type == "assistant" and c_type == "thinking":
             text = c.get("thinking", "")
-            results.append(("status", t("status_thinking", chars=len(text)), None))
+            if text:
+                # コードブロック内のバッククォート3連をエスケープ
+                escaped = text.replace("```", "` ` `")
+                results.append(("status", f":thought_balloon: thinking... ({len(text)}文字)\n```\n{escaped}\n```", None))
+            else:
+                results.append(("status", t("status_thinking", chars=0), None))
 
         elif entry_type == "assistant" and c_type == "text":
             text = c.get("text", "").strip()
@@ -1016,6 +1024,8 @@ def _read_subagent_jsonl_entries(
 def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: WebClient):
     """セッションJSONLファイルをポーリングし、新しいエントリをSlackに投稿。
     - thinking/tool_use → 1つのステータスメッセージをchat_updateで更新（:hourglass:付き）
+      thinkingが来るたびに表示をリセットし、最新の1セット（thinking+後続tool_use）のみ表示。
+      全履歴はall_status_historyに蓄積し、完了時にファイル添付で投稿。
     - text → 新しいメッセージとして投稿（応答テキスト）
     """
     pid = inst["pid"]
@@ -1038,13 +1048,24 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     all_status_history: list[str] = []    # 全ステータス履歴（完了時スニペット用）
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
-    pty_pending_cleaned: bool = False  # PTY pending cleanup 追跡
 
     # サブエージェント監視
     jsonl_dir = os.path.dirname(jsonl_path) if jsonl_path else ""
     session_id_for_subagents = os.path.splitext(os.path.basename(jsonl_path))[0] if jsonl_path else ""
     subagents_dir = os.path.join(jsonl_dir, session_id_for_subagents, "subagents") if jsonl_path else ""
     subagent_offsets: dict[str, int] = {}
+    # resume時: 既存サブエージェントJSONLの末尾から開始（前タスクのエントリを再投稿しない）
+    if not inst.get("start_from_beginning") and subagents_dir and os.path.isdir(subagents_dir):
+        try:
+            for _fn in os.listdir(subagents_dir):
+                if _fn.startswith("agent-") and _fn.endswith(".jsonl"):
+                    _fp = os.path.join(subagents_dir, _fn)
+                    try:
+                        subagent_offsets[_fp] = os.path.getsize(_fp)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     # プラン承認バッファリング（概要テキストを先に表示するため）
     pending_plan_approval: list | None = None  # [question_text, metadata, wait_count]
@@ -1060,9 +1081,16 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         else:
             sid = entry.get("sessionId")
         if sid and session_ref:
+            prev_sid = session_ref.claude_session_id
             logger.debug("JSONL monitor: session_id acquired sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
             session_ref.claude_session_id = sid
             runner.save_sessions()
+            # セッションID取得時にライフサイクルメッセージを更新（初回のみ）
+            if not prev_sid and task_ref and task_ref.lifecycle_msg_ts:
+                running_text = runner._build_lifecycle_text(
+                    session_ref, task_ref, "lifecycle_running", session_id=sid
+                )
+                runner._update_lifecycle_msg(session_ref, task_ref, running_text)
         if not task_ref:
             return
         # result type
@@ -1100,26 +1128,36 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         nonlocal status_msg_ts
         if not status_lines and not latest_text:
             return
+        suffix = "" if final else "\n" + t("status_running")
+        available = MAX_SLACK_MSG_LENGTH - len(suffix)
         parts = []
         if latest_text:
             display = _md_to_slack(latest_text)
             # テキスト部分が長すぎる場合は切り詰め
-            max_text = MAX_SLACK_MSG_LENGTH // 2
+            max_text = available // 2
             if len(display) > max_text:
                 display = display[:max_text] + "\n" + t("status_continued")
             parts.append(f":speech_balloon: {display_prefix}\n{display}")
         if status_lines:
             status_text = "\n".join(status_lines)
             # ステータス部分が長すぎる場合は切り詰め
-            max_status = MAX_SLACK_MSG_LENGTH // 2
+            max_status = available // 2
             if len(status_text) > max_status:
-                status_text = "...\n" + status_text[-max_status:]
+                status_text = status_text[:max_status] + "\n..."
             parts.append(status_text)
         text = "\n\n".join(parts)
-        if len(text) > MAX_SLACK_MSG_LENGTH:
-            text = "...\n" + text[-MAX_SLACK_MSG_LENGTH:]
-        if not final:
-            text += "\n" + t("status_running")
+        if len(text) > available:
+            text = "...\n" + text[-(available - 4):]
+        text += suffix
+        # JSONエンコーディングのエスケープ分を考慮したサイズチェック
+        # Slack APIはJSONペイロード全体で約40,000文字制限
+        # \n, \r, \t, \\, " はJSONエスケープで各1文字増加する
+        json_overhead = text.count('\n') + text.count('\r') + text.count('\t') + text.count('\\') + text.count('"')
+        json_limit = MAX_SLACK_MSG_LENGTH - 200  # JSONペイロードの構造分マージン
+        if len(text) + json_overhead > json_limit:
+            excess = len(text) + json_overhead - json_limit + 100
+            text = text[:len(text) - excess]
+            text = text.rsplit("\n", 1)[0] + "\n..."
         try:
             if status_msg_ts:
                 client.chat_update(
@@ -1131,7 +1169,19 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 )
                 status_msg_ts = resp["ts"]
         except Exception as e:
-            logger.error("JSONL progress update error PID %d: %s", pid, e)
+            # msg_too_longエラー時は積極的に切り詰めてリトライ
+            if "msg_too_long" in str(e) and len(text) > 2000:
+                text = text[:2000] + "\n..."
+                try:
+                    if status_msg_ts:
+                        client.chat_update(channel=channel, ts=status_msg_ts, text=text)
+                    else:
+                        resp = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+                        status_msg_ts = resp["ts"]
+                except Exception as e2:
+                    logger.error("JSONL progress update retry error PID %d: %s", pid, e2)
+            else:
+                logger.error("JSONL progress update error PID %d: %s", pid, e)
 
     def _finalize_progress():
         """進捗メッセージを確定（⏳除去）。メッセージは保持して次回も同じメッセージに追記。"""
@@ -1139,25 +1189,35 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _flush_progress(final=True)
 
     def _update_text(text: str):
-        """応答テキストを進捗メッセージ内に統合表示。同一テキストの重複更新を防止。"""
-        nonlocal last_posted_text, latest_text, pty_pending_cleaned
+        """応答テキストを新規メッセージとして投稿。同一テキストの重複投稿を防止。"""
+        nonlocal last_posted_text, latest_text, status_msg_ts, status_lines
         if text == last_posted_text:
-            return  # 同一テキストの重複更新を防止
+            return  # 同一テキストの重複投稿を防止
         last_posted_text = text
-        latest_text = text
+        latest_text = None  # 進捗メッセージには含めない
         # テキスト応答も履歴に追加（完了時スニペットに含めるため）
         all_status_history.append(f"💬\n{text}")
-        # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除（初回のみ）
-        if not pty_pending_cleaned:
-            _finalize_pty_pending(inst, channel, client, delete=True)
-            pty_pending_cleaned = True
-        # 進捗メッセージを更新（同じメッセージを使い続ける）
-        _flush_progress()
+        # 進捗メッセージを確定（ステータス行のみ残す）
+        if status_msg_ts and status_lines:
+            _flush_progress(final=True)
+        # テキスト応答を新規メッセージとして投稿（通知を発生させる）
+        display = _md_to_slack(text)
+        msg_text = f":speech_balloon: {display_prefix}\n{display}"
+        if len(msg_text) > MAX_SLACK_MSG_LENGTH:
+            msg_text = msg_text[:MAX_SLACK_MSG_LENGTH - 10] + "\n..."
+        try:
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=msg_text,
+            )
+        except Exception as e:
+            logger.error("Text response post error PID %d: %s", pid, e)
+        # リセット（次のステータス更新で新しい進捗メッセージを作成）
+        status_msg_ts = None
+        status_lines = []
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
-        # JSONL経由で正式な質問が来たため、PTYペンディングメッセージを削除
-        _finalize_pty_pending(inst, channel, client, delete=True)
         try:
             client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
@@ -1208,7 +1268,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             status_msg_ts = None
             status_lines = []
             latest_text = None
-            pty_pending_cleaned = False
 
         # JONLファイルが変わった可能性をチェック（外部インスタンス用）
         if not fixed_jsonl:
@@ -1219,6 +1278,10 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 jsonl_path = new_path
                 inst["jsonl_path"] = jsonl_path
                 file_offset = 0
+
+        # jsonl_pathがまだ見つかっていない場合はスキップ（bind時にJSONL未発見でも起動可能）
+        if not jsonl_path:
+            continue
 
         new_entries, file_offset = _read_new_jsonl_entries(jsonl_path, file_offset)
         if not new_entries:
@@ -1249,18 +1312,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         _flush_progress()
                     continue
 
-            # JONLに新しいデータなし → CLIが入力待ちの可能性
-            # Terminal内容を読んで許可プロンプトを検出（ttyがある場合のみ）
-            tty = inst.get("tty")
-            if tty and not inst.get("pending_question"):
-                terminal_content = _read_terminal_contents(f"/dev/{tty}")
-                if terminal_content:
-                    clean = _strip_ansi(terminal_content)
-                    # 末尾30行のみチェック（古い内容の誤検出を防止）
-                    recent = "\n".join(clean.split("\n")[-30:])
-                    prompt_info = _detect_permission_prompt(recent)
-                    if prompt_info:
-                        _post_permission_prompt(prompt_info, thread_ts, channel, client, inst)
             continue
 
         # エントリを分類して処理
@@ -1271,6 +1322,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
+                    # thinkingが来たら新しいセットを開始（最新セットのみ表示）
+                    if text.startswith(":thought_balloon:"):
+                        status_lines = []
                     status_lines.append(text)
                     all_status_history.append(text)
                     has_status = True
@@ -1287,8 +1341,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         pending_plan_approval = [text, metadata, 0]
                     else:
                         _post_question(text, metadata)
-                    # ステータスをリセット（回答後の思考は新メッセージに）
-                    status_msg_ts = None
+                    # ステータス内容をリセット（進捗メッセージは同一メッセージを使い続ける）
                     status_lines = []
                     latest_text = None
                     has_status = False
@@ -1311,7 +1364,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 _finalize_progress()
                 _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
                 pending_plan_approval = None
-                status_msg_ts = None
                 status_lines = []
                 latest_text = None
             else:
@@ -1322,7 +1374,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     _finalize_progress()
                     _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
                     pending_plan_approval = None
-                    status_msg_ts = None
                     status_lines = []
                     latest_text = None
 
@@ -1341,6 +1392,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
+                    # thinkingが来たら新しいセットを開始（最新セットのみ表示）
+                    if text.startswith(":thought_balloon:"):
+                        status_lines = []
                     status_lines.append(text)
                     all_status_history.append(text)
                     has_status = True
@@ -1484,47 +1538,6 @@ def _strip_ansi(text: str) -> str:
     return text
 
 
-def _filter_terminal_ui(text: str) -> str:
-    """ターミナルのUI要素（セパレーター、プロンプト、ステータスバー等）を除外"""
-    text = _strip_ansi(text)
-
-    lines = text.split('\n')
-    filtered = []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
-        # セパレーター行（─━═-のみで構成）
-        if re.match(r'^[─━═\-\s]+$', s):
-            continue
-        # プロンプト行（❯ で始まる）
-        if s.startswith('❯'):
-            continue
-        # ステータスバー（⏵を含む）
-        if '⏵' in s:
-            continue
-        # 思考スピナー（✶ · ✳ ✢ ✻ 等 + "…" を含む行）
-        if re.match(r'^[^\w\s].*…', s):
-            continue
-        # Claude Code UIヒント（ctrl+キー操作案内）
-        if 'to run in background' in s or re.search(r'ctrl\+\w', s):
-            continue
-        # タイマー表示 (5s), (28s) 等
-        if re.match(r'^\(\d+s\)$', s):
-            continue
-        # 折りたたみ出力ヒント
-        if re.match(r'^\d+\s+lines?\s*\(', s):
-            continue
-        # シェル環境変数出力（EMSDK等のプロファイル出力）
-        if re.match(r'^(Setting up EMSDK|Setting environment variables|[A-Z_]+ =\s*/)', s):
-            continue
-        # PATHフラグメント（コロン区切りパスの断片）
-        if re.match(r'^[/\w]*:[/\w]', s) and '/' in s and len(s) < 50:
-            continue
-        filtered.append(s)
-    return '\n'.join(filtered)
-
-
 def _set_pty_size(fd: int, cols: int = 120, rows: int = 40):
     """疑似ターミナルのウィンドウサイズを設定"""
     try:
@@ -1612,495 +1625,6 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
         "options": options,
         "multi_select": False,
     }
-
-
-def _monitor_pty_output(pid: int, master_fd: int, thread_ts: str, channel_id: str,
-                        client: WebClient, inst: dict | None):
-    """PTYのmaster_fd出力を監視し、idle検出でペンディング応答をSlackに投稿。
-    出力が一定時間停止した場合、バッファ内容をSlackスレッドに投稿する。
-    追加出力があればメッセージを上書き更新する。"""
-    buf = b""
-    MAX_BUF = 32 * 1024  # 32KBバッファ上限
-    IDLE_THRESHOLD = 3   # 連続idle回数（× 1秒）でペンディング投稿
-    idle_count = 0
-    buf_changed = False   # 前回投稿後にバッファに新データがあるか
-
-    while _is_process_alive(pid):
-        try:
-            rlist, _, _ = select.select([master_fd], [], [], 1.0)
-        except OSError:
-            break
-
-        if rlist:
-            try:
-                data = os.read(master_fd, 4096)
-                if not data:
-                    break
-                buf += data
-                if len(buf) > MAX_BUF:
-                    buf = buf[-MAX_BUF:]
-                idle_count = 0
-                buf_changed = True
-            except OSError:
-                break
-        else:
-            # select timeout — 出力なし
-            if not buf or not buf_changed:
-                continue
-            idle_count += 1
-            if idle_count >= IDLE_THRESHOLD:
-                _update_pty_pending(buf, inst, thread_ts, channel_id, client, pid)
-                buf_changed = False
-                idle_count = 0
-
-    # プロセス終了 → JSONL監視中はPTYペンディングを削除、それ以外は確定
-    jsonl_active = bool(inst.get("jsonl_path")) if inst else False
-    if buf_changed and inst:
-        _update_pty_pending(buf, inst, thread_ts, channel_id, client, pid)
-    if inst:
-        _finalize_pty_pending(inst, channel_id, client, delete=jsonl_active)
-
-
-def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
-                        channel_id: str, client: WebClient, pid: int):
-    """PTY idle検出時: バッファ内容を解析してSlackにペンディング応答として投稿/更新。
-    番号付き選択肢が検出された場合は質問形式で投稿し、pending_questionを設定する。
-    パターン不一致の場合はフィルタ済みコンテンツをそのまま表示する。
-    いずれも⏳インジケータ付きで、追加出力があれば上書き更新される。"""
-    if not inst:
-        return
-    if inst.get("pending_question"):
-        return  # 既に質問が投稿済み（JSONL経由等）
-    if inst.get("jsonl_path"):
-        return  # JSONL監視中はPTYペンディング投稿をスキップ（重複防止）
-
-    text = buf.decode("utf-8", errors="replace")
-    clean = _strip_ansi(text)
-    recent = "\n".join(clean.split("\n")[-30:])
-
-    # 番号付き選択肢パターンの検出
-    prompt_info = _detect_permission_prompt(recent)
-    if prompt_info:
-        description = prompt_info["description"]
-        options = prompt_info["options"]
-
-        parts = [t("question_cli_header"), description]
-        for i, opt in enumerate(options, 1):
-            parts.append(f"  {i}. {opt['label']}")
-        parts.append(t("question_reply_with_number"))
-        display_content = "\n".join(parts)
-
-        # pending_question を設定（回答ルーティング用）
-        inst["pending_question"] = {
-            "options": options,
-            "multi_select": False,
-        }
-    else:
-        # パターン不一致 → フィルタ済みコンテンツをSlack mrkdwnに変換して表示
-        filtered = _filter_terminal_ui(text).strip()
-        if not filtered:
-            return
-        display_content = _md_to_slack(filtered)
-        if len(display_content) > MAX_SLACK_MSG_LENGTH:
-            display_content = "...\n" + display_content[-MAX_SLACK_MSG_LENGTH:]
-
-    # 確定前テキストを保存（finalize用）
-    inst["pty_pending_text"] = display_content
-
-    # ペンディングインジケータ付きで表示
-    display = f"{t('status_cli_output_pending')}\n{display_content}"
-
-    pending_ts = inst.get("pty_pending_msg_ts")
-    try:
-        if pending_ts:
-            client.chat_update(
-                channel=channel_id, ts=pending_ts, text=display,
-            )
-        else:
-            resp = client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts, text=display,
-            )
-            inst["pty_pending_msg_ts"] = resp["ts"]
-    except Exception as e:
-        logger.error("PTY pending post error PID %d: %s", pid, e)
-
-
-def _finalize_pty_pending(inst: dict, channel_id: str, client: WebClient,
-                          *, delete: bool = False):
-    """PTYのペンディングメッセージを確定。
-    delete=True: JSONL経由で正式な応答が投稿されるため、PTYメッセージを削除。
-    delete=False: プロセス終了時等、⏳インジケータを除去してメッセージを残す。"""
-    pending_ts = inst.pop("pty_pending_msg_ts", None)
-    pending_text = inst.pop("pty_pending_text", None)
-    if not pending_ts:
-        return
-    try:
-        if delete:
-            client.chat_delete(channel=channel_id, ts=pending_ts)
-        elif pending_text:
-            client.chat_update(
-                channel=channel_id, ts=pending_ts, text=pending_text,
-            )
-    except Exception:
-        pass
-
-
-def _update_thinking_message(
-    client: WebClient, channel: str, msg_ts: str,
-    text: str, pid: int,
-):
-    """思考中の進捗を元メッセージに上書き（chat_update）— ベストエフォート"""
-    display = text
-    if len(display) > MAX_SLACK_MSG_LENGTH:
-        display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-    try:
-        client.chat_update(
-            channel=channel,
-            ts=msg_ts,
-            text=f"```\n{display}\n```\n{t('status_thinking_progress')}",
-        )
-    except Exception as e:
-        logger.error("Thinking update error PID %d: %s", pid, e)
-
-
-def _post_or_upload(
-    client: WebClient, channel: str, thread_ts: str,
-    text: str, *, header: str = "", filename: str = "response.md",
-):
-    """テキストをSlackに投稿。MAX_SLACK_MSG_LENGTHを超える場合はファイルとしてアップロード。"""
-    full_msg = f"{header}\n{text}" if header else text
-    if len(full_msg) <= MAX_SLACK_MSG_LENGTH:
-        client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=full_msg,
-        )
-    else:
-        # 先頭の概要をメッセージとして投稿
-        preview = text[:500] + t("task_see_full_file")
-        summary_msg = f"{header}\n{preview}" if header else preview
-        client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=summary_msg,
-        )
-        # 全文をファイルとしてアップロード
-        client.files_upload_v2(
-            channel=channel, thread_ts=thread_ts,
-            content=text, filename=filename,
-            title=t("task_full_text_title"),
-            initial_comment="",
-        )
-
-
-def _post_final_response(
-    client: WebClient, channel: str, thread_ts: str,
-    msg_ts: str, text: str, pid: int, timeout: bool = False,
-):
-    """応答完了時に新しいメッセージとして投稿（Slack通知が届く）+ 元メッセージの⏳を除去"""
-    if timeout:
-        header = t("task_timeout_header", pid=pid)
-    else:
-        header = f":speech_balloon: PID {pid}"
-    try:
-        _post_or_upload(
-            client, channel, thread_ts,
-            f"```\n{text}\n```",
-            header=header, filename=f"response_pid{pid}.md",
-        )
-    except Exception as e:
-        logger.error("Response post error PID %d: %s", pid, e)
-    # 元の「送信しました」メッセージから⏳を除去
-    try:
-        client.chat_update(
-            channel=channel,
-            ts=msg_ts,
-            text=t("input_sent", pid=pid),
-        )
-    except Exception:
-        pass
-
-
-def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: WebClient):
-    """バックグラウンドでターミナル出力を監視し、入力送信後の応答をSlackメッセージに反映"""
-    pid = inst["pid"]
-    tty = inst["tty"]
-    tty_device = f"/dev/{tty}"
-
-    STABLE_THRESHOLD = 2   # 安定判定に必要な連続同一回数（× TERMINAL_POLL_INTERVAL秒）
-    PROGRESS_INTERVAL = 2  # 思考中の進捗更新間隔（ポール回数）
-
-    last_filtered = ""
-    stable_count = 0
-    no_output_count = 0
-    poll_count = 0
-    last_progress_text = ""
-    baseline_content: Optional[str] = None  # ベースライン時点のターミナル内容
-
-    # パッシブ監視用状態（ユーザー入力なしでのターミナル変化追跡）
-    passive_last_filtered = ""
-    passive_stable_count = 0
-    passive_msg_ts: Optional[str] = None
-    passive_poll_count = 0
-
-    def _reset_state():
-        nonlocal last_filtered, stable_count, no_output_count, poll_count
-        nonlocal last_progress_text, baseline_content
-        nonlocal passive_last_filtered, passive_stable_count, passive_msg_ts, passive_poll_count
-        inst.pop("response_msg_ts", None)
-        inst.pop("input_baseline_len", None)
-        inst.pop("input_baseline_marker", None)
-        last_filtered = ""
-        stable_count = 0
-        no_output_count = 0
-        poll_count = 0
-        last_progress_text = ""
-        baseline_content = None
-        # パッシブ監視のベースラインを現在の内容に更新
-        cur = _read_terminal_contents(tty_device)
-        if cur:
-            inst["passive_baseline_len"] = len(cur)
-            inst["passive_baseline_marker"] = cur[-500:] if len(cur) >= 500 else cur
-        # パッシブ進捗メッセージを確定（⏳除去）
-        if passive_msg_ts and passive_last_filtered:
-            display = passive_last_filtered
-            if len(display) > MAX_SLACK_MSG_LENGTH:
-                display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-            try:
-                client.chat_update(
-                    channel=channel, ts=passive_msg_ts,
-                    text=f":speech_balloon: PID {pid}\n```\n{display}\n```",
-                )
-            except Exception:
-                pass
-        passive_last_filtered = ""
-        passive_stable_count = 0
-        passive_msg_ts = None
-        passive_poll_count = 0
-
-    while _is_process_alive(pid):
-        time.sleep(TERMINAL_POLL_INTERVAL)
-
-        response_msg_ts = inst.get("response_msg_ts")
-        baseline_len = inst.get("input_baseline_len")
-
-        # アクティブ監視（ユーザー入力後の応答追跡）がなければパッシブ監視
-        if response_msg_ts is None or baseline_len is None:
-            # パッシブ監視: ターミナル変化を自動的にスレッドに投稿
-            p_baseline_len = inst.get("passive_baseline_len")
-            p_marker = inst.get("passive_baseline_marker", "")
-            if p_baseline_len is None:
-                continue
-
-            current = _read_terminal_contents(tty_device)
-            if current is None:
-                continue
-
-            # マーカーで差分位置を特定
-            if p_marker:
-                marker_pos = current.find(p_marker)
-                if marker_pos >= 0:
-                    new_start = marker_pos + len(p_marker)
-                else:
-                    new_start = p_baseline_len
-            else:
-                new_start = p_baseline_len
-
-            # 行境界にアラインメント
-            if 0 < new_start < len(current) and current[new_start - 1] != '\n':
-                next_nl = current.find('\n', new_start)
-                if next_nl >= 0:
-                    new_start = next_nl + 1
-
-            new_text = current[new_start:]
-            if not new_text.strip():
-                continue
-
-            # 許可プロンプト検出（フィルタ前に実施。フィルタは❯行を除去するため）
-            if not inst.get("pending_question"):
-                clean_text = _strip_ansi(new_text)
-                recent_lines = "\n".join(clean_text.split("\n")[-30:])
-                prompt_info = _detect_permission_prompt(recent_lines)
-                if prompt_info:
-                    _post_permission_prompt(prompt_info, thread_ts, channel, client, inst)
-                    continue  # プロンプト投稿後は通常のパッシブ投稿をスキップ
-
-            filtered = _filter_terminal_ui(new_text).strip()
-            if not filtered:
-                continue
-
-            passive_poll_count += 1
-
-            # 安定判定（アクティブ監視と同じロジック）
-            len_diff = abs(len(filtered) - len(passive_last_filtered))
-            if filtered == passive_last_filtered or (len_diff <= 5 and filtered[:100] == passive_last_filtered[:100]):
-                passive_stable_count += 1
-            else:
-                passive_stable_count = 0
-                passive_last_filtered = filtered
-
-            # 安定したら確定メッセージとしてスレッドに投稿し、ベースラインを更新
-            if passive_stable_count >= STABLE_THRESHOLD:
-                display = filtered
-                if len(display) > MAX_SLACK_MSG_LENGTH:
-                    display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-                try:
-                    if passive_msg_ts:
-                        client.chat_update(
-                            channel=channel, ts=passive_msg_ts,
-                            text=f":speech_balloon: PID {pid}\n```\n{display}\n```",
-                        )
-                    else:
-                        client.chat_postMessage(
-                            channel=channel, thread_ts=thread_ts,
-                            text=f":speech_balloon: PID {pid}\n```\n{display}\n```",
-                        )
-                except Exception as e:
-                    logger.error("Passive monitor post error PID %d: %s", pid, e)
-                # ベースライン更新
-                inst["passive_baseline_len"] = len(current)
-                inst["passive_baseline_marker"] = current[-500:] if len(current) >= 500 else current
-                passive_last_filtered = ""
-                passive_stable_count = 0
-                passive_msg_ts = None
-                passive_poll_count = 0
-                continue
-
-            # 途中進捗の更新（2ポールごと、または初回）
-            if passive_msg_ts is None or passive_poll_count % PROGRESS_INTERVAL == 0:
-                display = filtered
-                if len(display) > MAX_SLACK_MSG_LENGTH:
-                    display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-                try:
-                    if passive_msg_ts:
-                        client.chat_update(
-                            channel=channel, ts=passive_msg_ts,
-                            text=f"```\n{display}\n```\n{t('status_running')}",
-                        )
-                    else:
-                        resp = client.chat_postMessage(
-                            channel=channel, thread_ts=thread_ts,
-                            text=f"```\n{display}\n```\n{t('status_running')}",
-                        )
-                        passive_msg_ts = resp["ts"]
-                except Exception as e:
-                    logger.error("Passive progress update error PID %d: %s", pid, e)
-            continue
-
-        poll_count += 1
-
-        current = _read_terminal_contents(tty_device)
-        if current is None:
-            logger.debug("MON %d poll %d: read failed", pid, poll_count)
-            continue
-
-        # ベースライン内容を記録（初回のみ）
-        if baseline_content is None:
-            baseline_content = current[:baseline_len] if baseline_len <= len(current) else current
-
-        # マーカーを使って差分の開始位置を特定（スクロールバックずれ対策）
-        marker = inst.get("input_baseline_marker", "")
-        if marker:
-            marker_pos = current.find(marker)
-            if marker_pos >= 0:
-                new_start = marker_pos + len(marker)
-            else:
-                # マーカーが見つからない（スクロールバックで完全に消えた）→ 長さフォールバック
-                new_start = max(0, len(current) - (baseline_len - len(current)) if len(current) < baseline_len else baseline_len)
-        else:
-            new_start = baseline_len
-
-        # マーカー境界が行途中の場合、最初の不完全行をスキップ
-        if new_start > 0 and new_start < len(current) and current[new_start - 1] != '\n':
-            next_nl = current.find('\n', new_start)
-            if next_nl >= 0:
-                new_start = next_nl + 1
-        new_text_raw = current[new_start:]
-        cur_len = len(current)
-        logger.debug("MON %d poll %d: cur_len=%d new_start=%d new_len=%d", pid, poll_count, cur_len, new_start, len(new_text_raw))
-
-        # 新しいテキストがない場合
-        if not new_text_raw.strip():
-            no_output_count += 1
-            if no_output_count >= STABLE_THRESHOLD:
-                clean_current = _strip_ansi(current).rstrip()
-                if re.search(r'❯\s*$', clean_current) or current != baseline_content:
-                    _post_final_response(client, channel, thread_ts, response_msg_ts, t("status_command_completed"), pid)
-                    _reset_state()
-            continue
-
-        new_text = new_text_raw
-        filtered = _filter_terminal_ui(new_text).strip()
-
-        # 新しいテキストの末尾で ❯ プロンプト判定（new_textの方がスクロールバック末尾より信頼性が高い）
-        clean_new = _strip_ansi(new_text).rstrip()
-        prompt_found = bool(re.search(r'❯\s*$', clean_new))
-
-        # デバッグ: フィルタ前のクリーンテキストも表示
-        clean_lines = _strip_ansi(new_text).strip().split('\n')
-        clean_preview = clean_lines[:5] if clean_lines else []
-        logger.debug("MON %d poll %d: filtered_len=%d prompt=%s raw_lines=%r", pid, poll_count, len(filtered), prompt_found, clean_preview)
-
-        if not filtered:
-            # フィルタ後にテキストがないが、❯プロンプトが末尾に出現 → 出力なしで完了
-            if prompt_found:
-                logger.debug("MON %d -> command completed (filtered empty + prompt)", pid)
-                _post_final_response(client, channel, thread_ts, response_msg_ts, t("status_command_completed"), pid)
-                _reset_state()
-            continue
-
-        no_output_count = 0
-
-        # 応答完了判定1: ❯ プロンプトが出現（次の入力待ち状態）
-        if prompt_found:
-            logger.debug("MON %d -> posting response (prompt detected)", pid)
-            _post_final_response(client, channel, thread_ts, response_msg_ts, filtered, pid)
-            _reset_state()
-            continue
-
-        # 応答完了判定2: フィルタ済みテキストが安定（STABLE_THRESHOLD回連続でほぼ同一）
-        # ターミナルのカーソル位置等で数文字揺れることがあるため、先頭100文字+長さ差±5で比較
-        len_diff = abs(len(filtered) - len(last_filtered))
-        if filtered == last_filtered or (len_diff <= 5 and filtered[:100] == last_filtered[:100]):
-            stable_count += 1
-        else:
-            stable_count = 0
-            last_filtered = filtered
-
-        if stable_count >= STABLE_THRESHOLD:
-            logger.debug("MON %d -> posting response (stable detected)", pid)
-            _post_final_response(client, channel, thread_ts, response_msg_ts, filtered, pid)
-            _reset_state()
-            continue
-
-        # 思考中の進捗更新: PROGRESS_INTERVALポールごとに途中経過を表示（ベストエフォート）
-        if poll_count % PROGRESS_INTERVAL == 0 and filtered != last_progress_text:
-            logger.debug("MON %d -> thinking update", pid)
-            _update_thinking_message(client, channel, response_msg_ts, filtered, pid)
-            last_progress_text = filtered
-
-    # プロセス終了 → 未完了の応答があれば最終投稿
-    response_msg_ts = inst.get("response_msg_ts")
-    baseline_len = inst.get("input_baseline_len")
-    if response_msg_ts and baseline_len is not None:
-        current = _read_terminal_contents(f"/dev/{tty}")
-        if current and len(current) > baseline_len:
-            filtered = _filter_terminal_ui(current[baseline_len:]).strip()
-            if filtered:
-                _post_final_response(client, channel, thread_ts, response_msg_ts, filtered, pid)
-
-    # プロセス終了通知
-    try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=t("session_pid_exited", pid=pid),
-        )
-    except Exception:
-        pass
-
-    # フォーク用クリーンアップ（bridge-spawned タスクは _execute の finally で既に除去済み）
-    if inst.get("session") and not inst.get("skip_exit_message"):
-        for ts, data in list(instance_threads.items()):
-            if data is inst:
-                instance_threads.pop(ts, None)
-                break
 
 
 # ── Claude Code ランナー ──────────────────────────────────
@@ -2353,7 +1877,8 @@ class ClaudeCodeRunner:
     def run_task(self, project: Project, session: Session, task: Task) -> Optional[str]:
         """タスク実行を開始。エラー時はメッセージ文字列を返す"""
         with self.lock:
-            task.id = self._next_id()
+            if task.id == 0:
+                task.id = self._next_id()
             session.tasks.append(task)
 
         thread = threading.Thread(
@@ -2371,29 +1896,19 @@ class ClaudeCodeRunner:
             task.status = TaskStatus.FAILED
             task.error = t("task_working_dir_not_set")
             task.completed_at = datetime.now()
-            self._post_to_session(session, f"{session.label_emoji} {task.short_id}  :x: {t('task_working_dir_not_set')}")
+            self._update_lifecycle_msg(session, task, f"{session.label_emoji} {task.short_id}  :x: {t('task_working_dir_not_set')}")
             return
         channel_id = session.channel_id
         thread_ts = session.thread_ts
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.now()
 
-        dir_display = os.path.basename(cwd) or cwd
         display_label = f"{session.label_emoji} {task.short_id}"
         is_resume = task.resume_session is not None
 
-        if is_resume:
-            header = (
-                f"{display_label}  {t('task_resume_header')}\n"
-                f"```{task.prompt[:500]}```"
-            )
-        else:
-            header = (
-                f"{display_label}  {t('task_start_header')}\n"
-                f":file_folder: `{dir_display}`\n"
-                f"```{task.prompt[:500]}```"
-            )
-        self._post_to_session(session, header)
+        # Stage 2: タスク準備中（ライフサイクルメッセージを更新）
+        preparing_text = self._build_lifecycle_text(session, task, "lifecycle_preparing")
+        self._update_lifecycle_msg(session, task, preparing_text)
 
         # PTYモード判定: プロンプトが200KB以下ならCLI引数で渡しPTYを使用
         prompt_bytes = task.prompt.encode("utf-8")
@@ -2427,6 +1942,23 @@ class ClaudeCodeRunner:
                 task.process = proc
                 task.master_fd = master_fd
 
+                # PTYのmaster側を読み捨てるスレッドを起動
+                # stdoutがPTY経由のため、読み取らないとカーネルバッファが
+                # 溢れてCLIプロセスのwrite()がブロックしハングする
+                def _drain_pty(fd):
+                    try:
+                        while True:
+                            try:
+                                data = os.read(fd, 4096)
+                                if not data:
+                                    break
+                            except OSError:
+                                break
+                    except Exception:
+                        pass
+                threading.Thread(target=_drain_pty, args=(master_fd,),
+                                 daemon=True).start()
+
                 # instance_threadsに登録（スレッド返信ルーティング有効化）
                 inst = {
                     "pid": proc.pid,
@@ -2440,14 +1972,6 @@ class ClaudeCodeRunner:
                 instance_threads[thread_ts] = inst
                 registered_thread_ts = thread_ts
 
-                # PTY出力監視スレッドを起動
-                pty_thread = threading.Thread(
-                    target=_monitor_pty_output,
-                    args=(proc.pid, master_fd, thread_ts, channel_id,
-                          self.client, instance_threads.get(thread_ts)),
-                    daemon=True,
-                )
-                pty_thread.start()
             else:
                 # フォールバック: 従来のstdin方式（長大プロンプト用）
                 cmd = self.build_command(task)
@@ -2463,6 +1987,10 @@ class ClaudeCodeRunner:
                 task.process = proc
                 proc.stdin.write(task.prompt)
                 proc.stdin.close()
+
+            # Stage 3: タスク実行中（ライフサイクルメッセージを更新）
+            running_text = self._build_lifecycle_text(session, task, "lifecycle_running")
+            self._update_lifecycle_msg(session, task, running_text)
 
             # JONLファイルが現れるまでポーリング（プロセス終了まで探し続ける）
             # resumeタスクの場合、既存JSONLのbirthtimeはstart_timeより古いため
@@ -2611,7 +2139,7 @@ class ClaudeCodeRunner:
             # ヘッダー部分の長さを考慮して、全体がMAX_SLACK_MSG_LENGTHに収まるか判定
             header_len = sum(len(p) for p in parts) + 10  # 改行等のマージン
             available = MAX_SLACK_MSG_LENGTH - header_len
-            if len(result_text) <= available:
+            if len(result_text) <= available and len(result_text.encode("utf-8")) <= available:
                 parts.append(f"\n{result_text}")
             else:
                 # メッセージには先頭のみ、全文はファイルアップロード
@@ -2622,6 +2150,68 @@ class ClaudeCodeRunner:
             parts.append(f"\n_Session: `{session.claude_session_id[:12]}...`_")
             parts.append(t("task_reply_to_continue"))
         return "\n".join(parts), full_result
+
+    def assign_task_id(self, task: Task):
+        """タスクIDを事前に割り当て（run_task前に呼び出し可能）"""
+        with self.lock:
+            if task.id == 0:
+                task.id = self._next_id()
+
+    def _build_lifecycle_text(self, session: Session, task: Task, status_key: str,
+                              *, session_id: str | None = None) -> str:
+        """ライフサイクルメッセージのテキストを組み立てる"""
+        display_label = f"{session.label_emoji} {task.short_id}"
+        is_resume = task.resume_session is not None
+        cwd = session.working_dir or ""
+        dir_display = os.path.basename(cwd) or cwd
+
+        status_text = t(status_key)
+        parts = [f"{display_label}  {status_text}"]
+
+        if is_resume:
+            parts.append(t("task_resume_header"))
+        else:
+            parts.append(f":file_folder: `{dir_display}`")
+
+        if session_id:
+            parts.append(f"_Session: `{session_id[:12]}...`_")
+
+        parts.append(f"```{task.prompt[:500]}```")
+        return "\n".join(parts)
+
+    def _post_lifecycle_msg(self, session: Session, task: Task, text: str):
+        """ライフサイクルメッセージを初回投稿し、tsをtaskに保存"""
+        try:
+            if session.thread_ts:
+                resp = self.client.chat_postMessage(
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts,
+                    text=text,
+                )
+            else:
+                resp = self.client.chat_postMessage(
+                    channel=session.channel_id,
+                    text=text,
+                )
+                session.thread_ts = resp["ts"]
+            task.lifecycle_msg_ts = resp["ts"]
+        except Exception as e:
+            logger.error("Lifecycle initial post error: %s", e)
+
+    def _update_lifecycle_msg(self, session: Session, task: Task, text: str):
+        """ライフサイクルメッセージを更新（chat_update）。ts未設定時は新規投稿にフォールバック"""
+        if task.lifecycle_msg_ts:
+            try:
+                self.client.chat_update(
+                    channel=session.channel_id,
+                    ts=task.lifecycle_msg_ts,
+                    text=text,
+                )
+                return
+            except Exception as e:
+                logger.error("Lifecycle message update error: %s", e)
+        # フォールバック: 新規投稿
+        self._post_lifecycle_msg(session, task, text)
 
     def _post_to_session(self, session: Session, text: str):
         """セッション（スレッド）にメッセージを投稿"""
@@ -2657,7 +2247,18 @@ class ClaudeCodeRunner:
     def _post_completion(self, session: Session, task: Task,
                          text: str, inst: dict | None,
                          *, full_result: str | None = None):
-        """完了メッセージ + ステータス履歴 + 結果全文をまとめて1メッセージで投稿"""
+        """完了メッセージ: ライフサイクルメッセージを削除 + 新規メッセージ投稿 + 添付ファイル送信"""
+        # ライフサイクルメッセージを削除（完了メッセージで置き換えるため）
+        if task.lifecycle_msg_ts:
+            try:
+                self.client.chat_delete(
+                    channel=session.channel_id,
+                    ts=task.lifecycle_msg_ts,
+                )
+            except Exception as e:
+                logger.debug("Lifecycle message delete (best-effort): %s", e)
+
+        # 添付ファイル準備
         status_history = inst.get("_status_history", []) if inst else []
         file_uploads: list[dict] = []
         if full_result:
@@ -2666,7 +2267,7 @@ class ClaudeCodeRunner:
                 "filename": f"result_{task.short_id}.md",
                 "title": t("task_full_text_title"),
             })
-        if len(status_history) >= 3:
+        if len(status_history) >= 1:
             snippet_content = "\n".join(status_history)
             file_uploads.append({
                 "content": snippet_content,
@@ -2683,8 +2284,9 @@ class ClaudeCodeRunner:
                 )
                 return
             except Exception as e:
-                logger.error("Completion upload error: %s", e)
-                # フォールバック: テキストのみ投稿
+                logger.error("Completion file upload error: %s", e)
+                # フォールバック: テキストのみ新規投稿
+        # ファイルアップロードなし or 失敗時: 新規メッセージとして投稿（通知を発生させる）
         self._post_to_session(session, text)
 
     def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
@@ -3037,6 +2639,11 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     else:
         logger.warning("_handle_thread_reply_task: no session_id, running new task without --resume thread=%s", thread_ts)
 
+    # Stage 1: リクエスト受付を即時投稿
+    runner.assign_task_id(task)
+    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+    runner._post_lifecycle_msg(session, task, text)
+
     logger.info("_handle_thread_reply_task: calling run_task thread=%s resume=%s disallowed=%s",
                 thread_ts, task.resume_session[:16] if task.resume_session else "None", task.disallowed_tools)
     err = runner.run_task(project, session, task)
@@ -3230,7 +2837,6 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
     tty = inst.get("tty", "")
     pid = inst["pid"]
     master_fd = inst.get("master_fd")
-    is_jsonl_mode = "jsonl_path" in inst
     pending_q = inst.get("pending_question")
 
     try:
@@ -3265,15 +2871,17 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                 session_ref = inst.get("session")
                 if session_ref:
                     session_ref.pending_question = None
-                _finalize_pty_pending(inst, channel_id, slack_client)
             elif pending_q and pending_q.get("multi_select", False):
                 # multi_select質問へのテキスト回答
                 inst.pop("pending_question", None)
                 session_ref = inst.get("session")
                 if session_ref:
                     session_ref.pending_question = None
-                _finalize_pty_pending(inst, channel_id, slack_client)
                 os.write(master_fd, text.encode("utf-8") + b"\r")
+            elif inst.get("bind_mode") == "live":
+                # バインドモード: フリーテキスト入力を許可
+                os.write(master_fd, text.encode("utf-8") + b"\r")
+                action_label = None
             else:
                 # 質問待ちでない → タスク実行中なので入力を受け付けない
                 say(text=t("input_blocked_task_running"), thread_ts=parent_ts)
@@ -3289,9 +2897,8 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                 thread_ts=parent_ts,
                 text=msg_text,
             )
-            if is_jsonl_mode:
-                inst["input_msg_ts"] = resp["ts"]
-                inst["input_msg_text"] = msg_text
+            inst["input_msg_ts"] = resp["ts"]
+            inst["input_msg_text"] = msg_text
             return True
 
         # ── TTYがない場合のエラー ──
@@ -3301,12 +2908,6 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
 
         # ── 既存のAppleScript処理（外部検出インスタンス用） ──
         tty_device = f"/dev/{tty}"
-
-        if not is_jsonl_mode:
-            # ターミナル監視モード: 入力前のターミナル末尾を記録
-            current_contents = _read_terminal_contents(tty_device) or ""
-            baseline_len = len(current_contents)
-            baseline_marker = current_contents[-500:] if len(current_contents) >= 500 else current_contents
 
         if pending_q and not pending_q.get("multi_select", False):
             # 選択肢回答モード
@@ -3339,15 +2940,22 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             session_ref = inst.get("session")
             if session_ref:
                 session_ref.pending_question = None
-            _finalize_pty_pending(inst, channel_id, slack_client)
         elif pending_q and pending_q.get("multi_select", False):
             # multi_select質問へのテキスト回答
             inst.pop("pending_question", None)
             session_ref = inst.get("session")
             if session_ref:
                 session_ref.pending_question = None
-            _finalize_pty_pending(inst, channel_id, slack_client)
 
+            subprocess.run(
+                ["pbcopy"],
+                input=text.encode("utf-8"),
+                timeout=5,
+            )
+            script = _build_paste_script(tty_device)
+            action_label = None
+        elif inst.get("bind_mode") == "live":
+            # バインドモード: フリーテキスト入力を許可（クリップボード+ペースト）
             subprocess.run(
                 ["pbcopy"],
                 input=text.encode("utf-8"),
@@ -3368,30 +2976,15 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             if action_label:
                 msg_text = t("input_answer_sent", pid=pid, label=action_label)
             else:
-                msg_text_done = t("input_sent", pid=pid)
-                msg_text_wait = t("input_sent_waiting", pid=pid)
+                msg_text = t("input_sent", pid=pid)
 
-            if is_jsonl_mode:
-                # JSONL監視モード: メッセージtsを保存してモニタがステータスを追記する
-                input_text = msg_text if action_label else msg_text_done
-                resp = slack_client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=parent_ts,
-                    text=input_text,
-                )
-                inst["input_msg_ts"] = resp["ts"]
-                inst["input_msg_text"] = input_text
-            else:
-                # ターミナル監視モード: tsを保存してモニタースレッドが応答で更新する
-                resp = slack_client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=parent_ts,
-                    text=msg_text if action_label else msg_text_wait,
-                )
-                if not action_label:
-                    inst["response_msg_ts"] = resp["ts"]
-                    inst["input_baseline_len"] = baseline_len
-                    inst["input_baseline_marker"] = baseline_marker
+            resp = slack_client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=parent_ts,
+                text=msg_text,
+            )
+            inst["input_msg_ts"] = resp["ts"]
+            inst["input_msg_text"] = msg_text
         else:
             say(text=t("error_input_send_failed", error=result.stderr.strip()), thread_ts=parent_ts)
     except OSError as e:
@@ -3571,6 +3164,11 @@ def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
         allowed_tools=session.consume_tools(),
         user_id=user_id,
     )
+    # Stage 1: リクエスト受付を即時投稿
+    runner.assign_task_id(task)
+    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+    runner._post_lifecycle_msg(session, task, text)
+
     err = runner.run_task(project, session, task)
     if err:
         say(text=err, thread_ts=thread_ts)
@@ -3758,6 +3356,11 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
             user_id=user_id,
         )
         task.resume_session = session_id
+        # Stage 1: リクエスト受付を即時投稿
+        runner.assign_task_id(task)
+        lc_text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+        runner._post_lifecycle_msg(session, task, lc_text)
+
         err = runner.run_task(project, session, task)
         if err:
             say(text=err, thread_ts=thread_ts)
