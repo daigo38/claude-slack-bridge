@@ -25,3 +25,6 @@ channel_roots.json
 .slack-attachments/
 .serena
 articles
+
+# Instance state
+.instance_state.json
