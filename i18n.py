@@ -120,11 +120,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bind_select_or_cancel": "\n番号を入力して選択、または `cancel` でキャンセル",
         "bind_cancelled": ":x: バインド選択をキャンセルしました",
         "bind_pid_exited": ":warning: PID {pid} は既に終了しています",
-        "bind_no_session_id": ":warning: PID {pid} のセッションIDを取得できませんでした。JONLファイルが見つかりません",
         "bind_start": (
-            ":link: PID {pid} のセッションを取り込みました\n"
+            ":link: PID {pid} にバインドしました（ライブI/O）\n"
             ":file_folder: `{cwd}`{sid_info}\n"
-            "_このスレッドに返信するとセッションを引き継いで実行します_"
+            "_ターミナルの出力がこのスレッドに表示されます。返信で入力を転送できます_"
         ),
         "bind_free_input_sent": ":arrow_right: PID {pid} にテキストを送信しました",
         "bind_session_takeover": (
@@ -330,11 +329,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bind_select_or_cancel": "\nEnter a number to select, or `cancel` to abort",
         "bind_cancelled": ":x: Bind selection cancelled",
         "bind_pid_exited": ":warning: PID {pid} has already exited",
-        "bind_no_session_id": ":warning: Could not retrieve session ID for PID {pid}. No JSONL file found",
         "bind_start": (
-            ":link: Imported session from PID {pid}\n"
+            ":link: Bound to PID {pid} (live I/O)\n"
             ":file_folder: `{cwd}`{sid_info}\n"
-            "_Reply in this thread to continue the session via --resume._"
+            "_Terminal output will appear in this thread. Reply to forward input._"
         ),
         "bind_free_input_sent": ":arrow_right: Text sent to PID {pid}",
         "bind_session_takeover": (

@@ -3587,10 +3587,10 @@ def _handle_bind_selection(text: str, say, channel_id: str) -> bool:
 
 
 def _execute_bind(inst_info: dict, channel_id: str, say, thread_ts, user_id: str):
-    """バインド実行: セッションIDを取得してSlackスレッドに紐付け。
-    スレッド返信で通常の --resume フローを使用（AppleScript不要）。"""
+    """バインド実行: プロセスのライブI/Oをスレッドに接続"""
     pid = inst_info["pid"]
     cwd = inst_info["cwd"]
+    tty = inst_info["tty"]
 
     # プロセス生存確認
     if not _is_process_alive(pid):
@@ -3606,27 +3606,49 @@ def _execute_bind(inst_info: dict, channel_id: str, say, thread_ts, user_id: str
         _extract_session_info_from_jsonl(dummy_task, dummy_session, jsonl_path)
         session_id = dummy_session.claude_session_id
 
-    if not session_id:
-        say(text=t("bind_no_session_id", pid=pid), thread_ts=thread_ts)
-        return
-
     # Project/Session 作成
     project = runner.get_or_create_project(channel_id)
 
     # 新しいトップレベルメッセージ（スレッド開始）
-    sid_info = f"\n_Session: `{session_id[:12]}...`_"
+    sid_info = f"\n_Session: `{session_id[:12]}...`_" if session_id else ""
     resp = slack_client.chat_postMessage(
         channel=channel_id,
         text=t("bind_start", pid=pid, cwd=cwd, sid_info=sid_info),
     )
     bind_thread_ts = resp["ts"]
 
-    # Session 作成（通常のセッションとして登録 → スレッド返信で --resume が自動適用）
+    # Session 作成
     session = project.get_or_create_session(bind_thread_ts)
     session.working_dir = cwd
-    session.claude_session_id = session_id
+    if session_id:
+        session.claude_session_id = session_id
     runner.save_sessions()
     runner.record_directory(channel_id, cwd)
+
+    # instance_threads に登録
+    bind_inst = {
+        "pid": pid,
+        "cwd": cwd,
+        "tty": tty,
+        "session": session,
+        "display_prefix": f"PID {pid}",
+        "skip_exit_message": False,
+        "bind_mode": "live",
+        "fixed_jsonl": False,
+    }
+    if jsonl_path:
+        bind_inst["jsonl_path"] = jsonl_path
+        _monitored_jsonl_paths.add(jsonl_path)
+
+    instance_threads[bind_thread_ts] = bind_inst
+
+    # JSONL監視スレッド起動（JSONL未発見でもfixed_jsonl=Falseで動的に発見）
+    monitor_thread = threading.Thread(
+        target=_bind_monitor_wrapper,
+        args=(bind_inst, bind_thread_ts, channel_id, session, jsonl_path),
+        daemon=True,
+    )
+    monitor_thread.start()
 
 
 def _bind_monitor_wrapper(inst: dict, thread_ts: str, channel_id: str,
