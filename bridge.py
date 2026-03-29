@@ -2758,9 +2758,9 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_sessions(say, thread_ts, channel_id)
         return
 
-    # ── fork [<PID>] [<task>] ──
-    if cmd_lower == "fork" or cmd_lower.startswith("fork "):
-        rest = text[4:].strip()
+    # ── resume / fork [<PID>] [<task>] ──
+    if cmd_lower == "resume" or cmd_lower.startswith("resume ") or cmd_lower == "fork" or cmd_lower.startswith("fork "):
+        rest = text.split(maxsplit=1)[1].strip() if " " in text else ""
         if not rest:
             _handle_fork_list(say, thread_ts, channel_id, user_id)
         else:
@@ -2784,13 +2784,6 @@ def _dispatch_command(text: str, event: dict, say):
         )
         return
 
-    # ── continue / resume （廃止） ──
-    if cmd_lower.startswith("continue") or cmd_lower.startswith("resume "):
-        say(
-            text=t("error_continue_deprecated"),
-            thread_ts=thread_ts,
-        )
-        return
 
     # ── root [<path>|clear] ──
     if cmd_lower == "root" or cmd_lower.startswith("root "):
@@ -3155,15 +3148,15 @@ def handle_slash_root(ack, command, say, respond):
     _handle_root(full_text, say, None, channel_id)
 
 
-@app.command("/fork")
-def handle_slash_fork(ack, command, say, respond):
+@app.command("/resume")
+def handle_slash_resume(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
     if not access:
         return
     user_id, channel_id = access
     rest = command.get("text", "").strip()
-    thread_ts = _slash_post_anchor(channel_id, user_id, "fork", rest)
+    thread_ts = _slash_post_anchor(channel_id, user_id, "resume", rest)
     if not rest:
         _handle_fork_list(say, thread_ts, channel_id, user_id)
     else:
