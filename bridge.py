@@ -2447,10 +2447,10 @@ instance_threads: dict[str, dict] = {}
 # 現在監視中のJSONLファイルパス（重複監視防止）
 _monitored_jsonl_paths: set[str] = set()
 
-# fork の複数候補選択状態（channel_id → 選択情報）
+# fork の複数候補選択状態（thread_ts → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
 
-# bind の複数候補選択状態（channel_id → 選択情報）
+# bind の複数候補選択状態（thread_ts → 選択情報）
 pending_bind_selections: dict[str, dict] = {}
 
 # ベアタスクのディレクトリ選択待ち状態（thread_ts → 選択情報）
@@ -2547,7 +2547,21 @@ def handle_message(event, say):
                 logger.info("Thread reply: instance_input returned False (EIO), falling through thread=%s", parent_ts)
                 # EIOでFalse返却 → instance_threads除去済み、セッション --resume パスへフォールスルー
 
-            # 1.5. ディレクトリ選択待ち → 選択処理
+            # 1.5. フォーク/バインド/ディレクトリ選択待ち → 選択処理
+            if parent_ts in pending_fork_selections:
+                fork_input = _strip_bot_mention(text)
+                if not fork_input:
+                    fork_input = text
+                if _handle_fork_selection(fork_input, say, parent_ts):
+                    return
+
+            if parent_ts in pending_bind_selections:
+                bind_input = _strip_bot_mention(text)
+                if not bind_input:
+                    bind_input = text
+                if _handle_bind_selection(bind_input, say, parent_ts):
+                    return
+
             if parent_ts in pending_directory_requests:
                 input_text = _strip_bot_mention(text)
                 if not input_text:
@@ -2605,22 +2619,6 @@ def handle_message(event, say):
                 logger.info("Thread reply: session NOT found and no mention, IGNORING thread=%s channel=%s",
                             parent_ts, channel_id)
             return
-
-        # フォーク選択割り込み（メンション有無問わず、番号 or cancel のみ処理）
-        if channel_id in pending_fork_selections:
-            fork_input = _strip_bot_mention(text)
-            if fork_input == text:
-                fork_input = text  # メンションなしでもOK
-            if _handle_fork_selection(fork_input, say, channel_id):
-                return
-
-        # バインド選択割り込み
-        if channel_id in pending_bind_selections:
-            bind_input = _strip_bot_mention(text)
-            if bind_input == text:
-                bind_input = text
-            if _handle_bind_selection(bind_input, say, channel_id):
-                return
 
         # トップレベルメッセージ: botメンション必須
         stripped = _strip_bot_mention(text)
@@ -3390,10 +3388,11 @@ def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
     lines.append(t("fork_select_or_cancel"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
-    pending_fork_selections[channel_id] = {
+    pending_fork_selections[thread_ts] = {
         "instances": candidates,
         "thread_ts": thread_ts,
         "user_id": user_id,
+        "channel_id": channel_id,
     }
 
 
@@ -3455,21 +3454,22 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
             say(text=err, thread_ts=thread_ts)
 
 
-def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
+def _handle_fork_selection(text: str, say, parent_ts: str) -> bool:
     """pending_fork_selections の番号選択/キャンセルを処理。
     処理した場合 True、fallthrough の場合 False を返す。"""
-    if channel_id not in pending_fork_selections:
+    if parent_ts not in pending_fork_selections:
         return False
 
-    selection = pending_fork_selections[channel_id]
+    selection = pending_fork_selections[parent_ts]
     instances = selection["instances"]
     thread_ts = selection["thread_ts"]
     user_id = selection["user_id"]
+    channel_id = selection["channel_id"]
     input_text = text.strip().lower()
 
     # cancel
     if input_text == "cancel":
-        del pending_fork_selections[channel_id]
+        del pending_fork_selections[parent_ts]
         say(text=t("fork_cancelled"), thread_ts=thread_ts)
         return True
 
@@ -3484,7 +3484,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
         return True
 
     selected = instances[num - 1]
-    del pending_fork_selections[channel_id]
+    del pending_fork_selections[parent_ts]
 
     # プロセス死亡チェック
     if not _is_process_alive(selected["pid"]):
@@ -3542,27 +3542,29 @@ def _handle_bind_list(say, thread_ts, channel_id: str, user_id: str):
     lines.append(t("bind_select_or_cancel"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
-    pending_bind_selections[channel_id] = {
+    pending_bind_selections[thread_ts] = {
         "instances": candidates,
         "thread_ts": thread_ts,
         "user_id": user_id,
+        "channel_id": channel_id,
     }
 
 
-def _handle_bind_selection(text: str, say, channel_id: str) -> bool:
+def _handle_bind_selection(text: str, say, parent_ts: str) -> bool:
     """pending_bind_selections の番号選択/キャンセルを処理。
     処理した場合 True、fallthrough の場合 False を返す。"""
-    if channel_id not in pending_bind_selections:
+    if parent_ts not in pending_bind_selections:
         return False
 
-    selection = pending_bind_selections[channel_id]
+    selection = pending_bind_selections[parent_ts]
     instances = selection["instances"]
     thread_ts = selection["thread_ts"]
     user_id = selection["user_id"]
+    channel_id = selection["channel_id"]
     input_text = text.strip().lower()
 
     if input_text == "cancel":
-        del pending_bind_selections[channel_id]
+        del pending_bind_selections[parent_ts]
         say(text=t("bind_cancelled"), thread_ts=thread_ts)
         return True
 
@@ -3576,7 +3578,7 @@ def _handle_bind_selection(text: str, say, channel_id: str) -> bool:
         return True
 
     selected = instances[num - 1]
-    del pending_bind_selections[channel_id]
+    del pending_bind_selections[parent_ts]
 
     if not _is_process_alive(selected["pid"]):
         say(text=t("bind_pid_exited", pid=selected['pid']), thread_ts=thread_ts)
