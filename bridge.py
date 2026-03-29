@@ -3996,8 +3996,8 @@ def _check_idle_session_takeovers():
                                     continue
                         if jsonl_sid:
                             matched_session, matched_project = known_sessions[jsonl_sid]
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
 
             if matched_session and matched_project:
                 _initiate_idle_takeover(ext, matched_session, matched_project)
