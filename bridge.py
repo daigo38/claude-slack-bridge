@@ -3091,6 +3091,123 @@ def handle_mention(event, say):
     pass
 
 
+# ── スラッシュコマンド ──
+def _slash_check_access(command, respond) -> tuple[str, str] | None:
+    """アクセス制御チェック。通過時は (user_id, channel_id) を返す。"""
+    user_id = command.get("user_id", "")
+    channel_id = command.get("channel_id", "")
+    if not _is_channel_allowed(channel_id) or not _is_user_allowed(user_id):
+        respond(text=t("error_user_not_allowed"))
+        return None
+    return user_id, channel_id
+
+
+def _slash_post_anchor(channel_id: str, user_id: str, cmd_name: str, text: str) -> str:
+    """スレッドアンカーとなるメッセージを投稿し、thread_tsを返す"""
+    display = f"/{cmd_name} {text}".strip()
+    result = slack_client.chat_postMessage(
+        channel=channel_id,
+        text=f"<@{user_id}> `{display}`",
+    )
+    return result["ts"]
+
+
+@app.command("/status")
+def handle_slash_status(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    _, channel_id = access
+    _handle_status(say, None, channel_id)
+
+
+@app.command("/cancel")
+def handle_slash_cancel(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    _, channel_id = access
+    text = command.get("text", "").strip() or "cancel"
+    _handle_cancel(text, say, None, channel_id)
+
+
+@app.command("/sessions")
+def handle_slash_sessions(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    _, channel_id = access
+    _handle_sessions(say, None, channel_id)
+
+
+@app.command("/root")
+def handle_slash_root(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    _, channel_id = access
+    text = command.get("text", "").strip()
+    full_text = f"root {text}".strip()
+    _handle_root(full_text, say, None, channel_id)
+
+
+@app.command("/fork")
+def handle_slash_fork(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    user_id, channel_id = access
+    rest = command.get("text", "").strip()
+    thread_ts = _slash_post_anchor(channel_id, user_id, "fork", rest)
+    if not rest:
+        _handle_fork_list(say, thread_ts, channel_id, user_id)
+    else:
+        _handle_fork(rest, say, thread_ts, channel_id, user_id, [])
+
+
+@app.command("/bind")
+def handle_slash_bind(ack, command, say, respond):
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    user_id, channel_id = access
+    rest = command.get("text", "").strip()
+    thread_ts = _slash_post_anchor(channel_id, user_id, "bind", rest)
+    if not rest:
+        _handle_bind_list(say, thread_ts, channel_id, user_id)
+    else:
+        _handle_bind(rest, say, thread_ts, channel_id, user_id)
+
+
+@app.command("/cc")
+def handle_slash_cc(ack, command, say, respond):
+    """ベアタスク用: /cc <タスク> で実行"""
+    ack()
+    access = _slash_check_access(command, respond)
+    if not access:
+        return
+    user_id, channel_id = access
+    text = command.get("text", "").strip()
+    if not text:
+        respond(text=_help_text())
+        return
+    thread_ts = _slash_post_anchor(channel_id, user_id, "cc", text)
+    synthetic_event = {
+        "channel": channel_id,
+        "ts": thread_ts,
+        "user": user_id,
+        "text": text,
+        "files": [],
+    }
+    _handle_bare_task(text, synthetic_event, say, channel_id, user_id)
+
+
 def _help_text() -> str:
     return t("help_text")
 

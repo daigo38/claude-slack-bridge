@@ -8,7 +8,49 @@
     "bot_user": {
       "display_name": "Claude Code",
       "always_online": true
-    }
+    },
+    "slash_commands": [
+      {
+        "command": "/status",
+        "description": "Show running task status",
+        "should_escape": false
+      },
+      {
+        "command": "/cancel",
+        "description": "Cancel a running task",
+        "usage_hint": "[task ID]",
+        "should_escape": false
+      },
+      {
+        "command": "/sessions",
+        "description": "List sessions in this channel",
+        "should_escape": false
+      },
+      {
+        "command": "/root",
+        "description": "Set/show channel root directory",
+        "usage_hint": "[path|clear]",
+        "should_escape": false
+      },
+      {
+        "command": "/fork",
+        "description": "Import a running Claude CLI process",
+        "usage_hint": "[PID] [task]",
+        "should_escape": false
+      },
+      {
+        "command": "/bind",
+        "description": "Live-connect to a running Claude CLI process",
+        "usage_hint": "[PID]",
+        "should_escape": false
+      },
+      {
+        "command": "/cc",
+        "description": "Run a Claude Code task",
+        "usage_hint": "task description",
+        "should_escape": false
+      }
+    ]
   },
   "oauth_config": {
     "scopes": {
@@ -17,11 +59,15 @@
         "channels:history",
         "groups:history",
         "files:read",
-        "files:write"
+        "files:write",
+        "commands"
       ]
     }
   },
   "settings": {
+    "interactivity": {
+      "is_enabled": true
+    },
     "event_subscriptions": {
       "bot_events": [
         "message.channels",
