@@ -43,12 +43,6 @@
         "description": "Live-connect to a running Claude CLI process",
         "usage_hint": "[PID]",
         "should_escape": false
-      },
-      {
-        "command": "/cc",
-        "description": "Run a Claude Code task",
-        "usage_hint": "task description",
-        "should_escape": false
       }
     ]
   },

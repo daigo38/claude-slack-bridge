@@ -3105,6 +3105,13 @@ def _slash_post_anchor(channel_id: str, user_id: str, cmd_name: str, text: str) 
     return result["ts"]
 
 
+def _ephemeral(respond):
+    """respond をsay互換にラップ（thread_ts等を無視してephemeral投稿）"""
+    def wrapper(text="", **kwargs):
+        respond(text=text)
+    return wrapper
+
+
 @app.command("/status-cc")
 def handle_slash_status(ack, command, say, respond):
     ack()
@@ -3112,7 +3119,7 @@ def handle_slash_status(ack, command, say, respond):
     if not access:
         return
     _, channel_id = access
-    _handle_status(say, None, channel_id)
+    _handle_status(_ephemeral(respond), None, channel_id)
 
 
 @app.command("/cancel-cc")
@@ -3123,7 +3130,7 @@ def handle_slash_cancel(ack, command, say, respond):
         return
     _, channel_id = access
     text = command.get("text", "").strip() or "cancel"
-    _handle_cancel(text, say, None, channel_id)
+    _handle_cancel(text, _ephemeral(respond), None, channel_id)
 
 
 @app.command("/sessions-cc")
@@ -3133,7 +3140,7 @@ def handle_slash_sessions(ack, command, say, respond):
     if not access:
         return
     _, channel_id = access
-    _handle_sessions(say, None, channel_id)
+    _handle_sessions(_ephemeral(respond), None, channel_id)
 
 
 @app.command("/root-cc")
@@ -3145,7 +3152,7 @@ def handle_slash_root(ack, command, say, respond):
     _, channel_id = access
     text = command.get("text", "").strip()
     full_text = f"root {text}".strip()
-    _handle_root(full_text, say, None, channel_id)
+    _handle_root(full_text, _ephemeral(respond), None, channel_id)
 
 
 @app.command("/resume-cc")
@@ -3177,28 +3184,6 @@ def handle_slash_bind(ack, command, say, respond):
     else:
         _handle_bind(rest, say, thread_ts, channel_id, user_id)
 
-
-@app.command("/cc")
-def handle_slash_cc(ack, command, say, respond):
-    """ベアタスク用: /cc <タスク> で実行"""
-    ack()
-    access = _slash_check_access(command, respond)
-    if not access:
-        return
-    user_id, channel_id = access
-    text = command.get("text", "").strip()
-    if not text:
-        respond(text=_help_text())
-        return
-    thread_ts = _slash_post_anchor(channel_id, user_id, "cc", text)
-    synthetic_event = {
-        "channel": channel_id,
-        "ts": thread_ts,
-        "user": user_id,
-        "text": text,
-        "files": [],
-    }
-    _handle_bare_task(text, synthetic_event, say, channel_id, user_id)
 
 
 def _help_text() -> str:
