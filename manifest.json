@@ -11,35 +11,35 @@
     },
     "slash_commands": [
       {
-        "command": "/status",
+        "command": "/status-cc",
         "description": "Show running task status",
         "should_escape": false
       },
       {
-        "command": "/cancel",
+        "command": "/cancel-cc",
         "description": "Cancel a running task",
         "usage_hint": "[task ID]",
         "should_escape": false
       },
       {
-        "command": "/sessions",
+        "command": "/sessions-cc",
         "description": "List sessions in this channel",
         "should_escape": false
       },
       {
-        "command": "/root",
+        "command": "/root-cc",
         "description": "Set/show channel root directory",
         "usage_hint": "[path|clear]",
         "should_escape": false
       },
       {
-        "command": "/resume",
+        "command": "/resume-cc",
         "description": "Resume a running Claude CLI session",
         "usage_hint": "[PID] [task]",
         "should_escape": false
       },
       {
-        "command": "/bind",
+        "command": "/bind-cc",
         "description": "Live-connect to a running Claude CLI process",
         "usage_hint": "[PID]",
         "should_escape": false

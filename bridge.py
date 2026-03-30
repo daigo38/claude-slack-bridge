@@ -3105,7 +3105,7 @@ def _slash_post_anchor(channel_id: str, user_id: str, cmd_name: str, text: str) 
     return result["ts"]
 
 
-@app.command("/status")
+@app.command("/status-cc")
 def handle_slash_status(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3115,7 +3115,7 @@ def handle_slash_status(ack, command, say, respond):
     _handle_status(say, None, channel_id)
 
 
-@app.command("/cancel")
+@app.command("/cancel-cc")
 def handle_slash_cancel(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3126,7 +3126,7 @@ def handle_slash_cancel(ack, command, say, respond):
     _handle_cancel(text, say, None, channel_id)
 
 
-@app.command("/sessions")
+@app.command("/sessions-cc")
 def handle_slash_sessions(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3136,7 +3136,7 @@ def handle_slash_sessions(ack, command, say, respond):
     _handle_sessions(say, None, channel_id)
 
 
-@app.command("/root")
+@app.command("/root-cc")
 def handle_slash_root(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3148,7 +3148,7 @@ def handle_slash_root(ack, command, say, respond):
     _handle_root(full_text, say, None, channel_id)
 
 
-@app.command("/resume")
+@app.command("/resume-cc")
 def handle_slash_resume(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3156,14 +3156,14 @@ def handle_slash_resume(ack, command, say, respond):
         return
     user_id, channel_id = access
     rest = command.get("text", "").strip()
-    thread_ts = _slash_post_anchor(channel_id, user_id, "resume", rest)
+    thread_ts = _slash_post_anchor(channel_id, user_id, "resume-cc", rest)
     if not rest:
         _handle_fork_list(say, thread_ts, channel_id, user_id)
     else:
         _handle_fork(rest, say, thread_ts, channel_id, user_id, [])
 
 
-@app.command("/bind")
+@app.command("/bind-cc")
 def handle_slash_bind(ack, command, say, respond):
     ack()
     access = _slash_check_access(command, respond)
@@ -3171,7 +3171,7 @@ def handle_slash_bind(ack, command, say, respond):
         return
     user_id, channel_id = access
     rest = command.get("text", "").strip()
-    thread_ts = _slash_post_anchor(channel_id, user_id, "bind", rest)
+    thread_ts = _slash_post_anchor(channel_id, user_id, "bind-cc", rest)
     if not rest:
         _handle_bind_list(say, thread_ts, channel_id, user_id)
     else:
